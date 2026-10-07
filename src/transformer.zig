@@ -30229,14 +30229,51 @@ pub const Transformer = struct {
         const gdn_in_itemsize = mlx.mlx_array_itemsize(q_scaled);
         const gdn_state_dtype = mlx.mlx_array_dtype(ssm.ssm_state);
 
-        if (!mlx.streamIsMetal(self.s)) return error.MetalKernelNeedsGpuStream;
-
+        // The MSL kernels below are Metal-only. On a stream that cannot run
+        // MSL (omarchy Vulkan) run the recurrence in plain MLX ops instead —
+        // per-token at decode/verify widths, chunked closed-form delta rule
+        // at prefill widths — and fall through to the composed epilogue.
+        var y_bthd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_bthd);
+        if (!mlx.streamIsMetal(self.s)) {
+            if (self.spec_capture_ssm and seq_len > gdn_decode.MAX_SEQ) return error.GdnPlainWidth; // chunked path emits no per-position states
+            if (qwen4Standin().gdn_recur) {
+                _ = mlx.mlx_array_free(y_bthd);
+                y_bthd = try standinRef(v_heads);
+            } else {
+                var plain = if (seq_len <= gdn_decode.MAX_SEQ)
+                    try gdn_decode.serialRecur(.{
+                        .q = q_scaled,
+                        .k = k_scaled,
+                        .v = v_heads,
+                        .g = g,
+                        .beta = beta,
+                        .state = ssm.ssm_state,
+                    }, self.spec_capture_ssm, self.s)
+                else
+                    try gdn_decode.chunkedRecur(.{
+                        .q = q_scaled,
+                        .k = k_scaled,
+                        .v = v_heads,
+                        .g = g,
+                        .beta = beta,
+                        .state = ssm.ssm_state,
+                    }, self.s);
+                defer plain.deinit();
+                if (plain.state_seq.ctx != null) {
+                    if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                    ssm.spec_state_seq = plain.state_seq;
+                    plain.state_seq = .{ .ctx = null };
+                }
+                _ = mlx.mlx_array_free(ssm.ssm_state);
+                ssm.ssm_state = plain.state;
+                plain.state = .{ .ctx = null };
+                try mlx.check(mlx.mlx_array_set(&y_bthd, plain.y));
+            }
+        } else {
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
-
-        var y_bthd = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y_bthd);
 
         if (self.spec_capture_ssm) {
             // Spec verify pass: emit per-position states so partial-accept
@@ -30330,6 +30367,7 @@ pub const Transformer = struct {
                 ssm.ssm_state = new_state;
             }
         }
+        } // streamIsMetal kernel dispatch
 
         // Fused epilogue: rms_norm(y) * silu(z) straight to the flat
         // out_proj input (decode/verify widths, per-head swish gate archs).
@@ -64709,6 +64747,135 @@ fn gdnRecurRand(rnd: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_d
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, f32arr, dt, s));
     return out;
+}
+
+/// Uniform [lo, hi) drawn in f32, cast to bf16 — for gates in (0, 1).
+fn gdnPlainGateRand(rnd: std.Random, shape: []const c_int, lo: f32, hi: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try testing.allocator.alloc(f32, n);
+    defer testing.allocator.free(data);
+    for (data) |*x| x.* = lo + rnd.float(f32) * (hi - lo);
+    const f32arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f32arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32arr, .bfloat16, s));
+    return out;
+}
+
+test "gdn plain recurrence: serial and chunked match the MSL kernel (Metal) or the f64 host reference" {
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    const metal = mlx.streamIsMetal(s);
+    const spanOf = struct {
+        fn f(x: []const f32) f32 {
+            var m: f32 = 0;
+            for (x) |v| m = @max(m, @abs(v));
+            return m;
+        }
+    }.f;
+    const Case = struct { hk: c_int, hv: c_int, t: c_int };
+    // 70 crosses a chunk boundary with a padded tail; 9 is the smallest chunked width.
+    const cases = [_]Case{
+        .{ .hk = 1, .hv = 2, .t = 1 },
+        .{ .hk = 2, .hv = 4, .t = 3 },
+        .{ .hk = 2, .hv = 4, .t = 8 },
+        .{ .hk = 16, .hv = 32, .t = 9 },
+        .{ .hk = 16, .hv = 32, .t = 70 },
+    };
+    const B: c_int = 1;
+    const dk: c_int = 128;
+    const dv: c_int = 128;
+    for (cases) |case| {
+        var prng = std.Random.DefaultPrng.init(0x9E37 + @as(u64, @intCast(case.t * 131 + case.hv * 7)));
+        const rnd = prng.random();
+        const q = try gdnRecurRand(rnd, &.{ B, case.t, case.hk, dk }, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try gdnRecurRand(rnd, &.{ B, case.t, case.hk, dk }, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try gdnRecurRand(rnd, &.{ B, case.t, case.hv, dv }, 1.0, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(v);
+        const g = try gdnPlainGateRand(rnd, &.{ B, case.t, case.hv }, 0.5, 0.99, s);
+        defer _ = mlx.mlx_array_free(g);
+        const beta = try gdnPlainGateRand(rnd, &.{ B, case.t, case.hv }, 0.05, 0.95, s);
+        defer _ = mlx.mlx_array_free(beta);
+        const state = try gdnRecurRand(rnd, &.{ B, case.hv, dv, dk }, 0.5, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(state);
+
+        // f64 reference on the same bf16-rounded inputs.
+        const nq: usize = @intCast(B * case.t * case.hk * dk);
+        const nv: usize = @intCast(B * case.t * case.hv * dv);
+        const ng: usize = @intCast(B * case.t * case.hv);
+        const ns: usize = @intCast(B * case.hv * dv * dk);
+        const qd = try evalToF32(al, q, nq, s);
+        defer al.free(qd);
+        const kd = try evalToF32(al, k, nq, s);
+        defer al.free(kd);
+        const vd = try evalToF32(al, v, nv, s);
+        defer al.free(vd);
+        const gd = try evalToF32(al, g, ng, s);
+        defer al.free(gd);
+        const bd = try evalToF32(al, beta, ng, s);
+        defer al.free(bd);
+        const sd = try evalToF32(al, state, ns, s);
+        defer al.free(sd);
+        const ref = try gdnHostRef(al, qd, kd, vd, gd, bd, sd, @intCast(B), @intCast(case.t), @intCast(case.hk), @intCast(case.hv), @intCast(dk), @intCast(dv));
+        defer al.free(ref.y);
+        defer al.free(ref.state);
+        const stol = 0.02 + 0.01 * spanOf(ref.state);
+        const ytol = 0.02 + 0.01 * spanOf(ref.y);
+
+        const in_args = gdn_decode.PlainIn{ .q = q, .k = k, .v = v, .g = g, .beta = beta, .state = state };
+        var serial: ?gdn_decode.PlainOut = if (case.t <= gdn_decode.MAX_SEQ) try gdn_decode.serialRecur(in_args, case.t >= 2, s) else null;
+        defer if (serial) |*p| p.deinit();
+        const chunked = try gdn_decode.chunkedRecur(in_args, s);
+        defer chunked.deinit();
+
+        const chunked_st = try evalToF32(al, chunked.state, ns, s);
+        defer al.free(chunked_st);
+        const chunked_y = try evalToF32(al, chunked.y, nv, s);
+        defer al.free(chunked_y);
+
+        // MSL kernel parity on Metal (the stock per-token kernel, any width).
+        if (metal) {
+            const msl_state = try gdnTestRun(false, false, q, k, v, g, beta, state, B, case.t, case.hk, case.hv, dk, dv, s);
+            defer _ = mlx.mlx_array_free(msl_state);
+            const msl = try evalToF32(al, msl_state, ns, s);
+            defer al.free(msl);
+            try testing.expect(maxAbsDiff(chunked_st, msl) <= stol);
+            if (serial) |p| {
+                const serial_st = try evalToF32(al, p.state, ns, s);
+                defer al.free(serial_st);
+                try testing.expect(maxAbsDiff(serial_st, msl) <= stol);
+            }
+        }
+
+        // Host-reference parity everywhere (Linux runs this arm only).
+        try testing.expect(maxAbsDiff(chunked_st, ref.state) <= stol);
+        try testing.expect(maxAbsDiff(chunked_y, ref.y) <= ytol);
+        if (serial) |p| {
+            const serial_st = try evalToF32(al, p.state, ns, s);
+            defer al.free(serial_st);
+            const serial_y = try evalToF32(al, p.y, nv, s);
+            defer al.free(serial_y);
+            try testing.expect(maxAbsDiff(serial_st, ref.state) <= stol);
+            try testing.expect(maxAbsDiff(serial_y, ref.y) <= ytol);
+            try testing.expect(maxAbsDiff(serial_st, chunked_st) <= stol);
+
+            // Per-position states match the seq kernel's serial rounding.
+            if (metal and p.state_seq.ctx != null and case.t >= 2) {
+                const seq = try evalToF32(al, p.state_seq, @as(usize, @intCast(case.t)) * ns, s);
+                defer al.free(seq);
+                for (0..@intCast(case.t - 1)) |pos| {
+                    const msl_at = try gdnTestRunSeqAt(q, k, v, g, beta, state, B, case.t, case.hk, case.hv, dk, dv, @as(c_int, @intCast(pos)), s);
+                    defer _ = mlx.mlx_array_free(msl_at);
+                    const at = try evalToF32(al, msl_at, ns, s);
+                    defer al.free(at);
+                    try testing.expect(maxAbsDiff(seq[pos * ns ..][0..ns], at) <= stol);
+                }
+            }
+        }
+    }
 }
 
 /// `x[:, from:to]` on axis 1, any rank.
