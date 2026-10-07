@@ -628,6 +628,7 @@ fn execInPlace(arena: Allocator, argv: []const []const u8) void {
 
 /// Another process running a binary from `dir`, or null.
 fn otherProcessIn(dir: []const u8) ?c_int {
+    if (comptime @import("builtin").os.tag != .macos) return null; // proc_listallpids/proc_pidpath are darwin-only
     var pids: [8192]c_int = undefined;
     const n = proc_listallpids(&pids, @sizeOf(@TypeOf(pids)));
     if (n <= 0) return null;
@@ -658,6 +659,7 @@ pub fn selfInstallRefusal(io: std.Io, path_buf: []u8, buf: []u8) ?[]const u8 {
 /// `sushi update --relaunch -- <argv>`. An exec that cannot happen exits non-zero rather than looking like a
 /// clean stop.
 pub fn relaunchIfRequested(allocator: Allocator, io: std.Io, args: []const []const u8) void {
+    if (comptime @import("builtin").os.tag != .macos) return; // darwin posix_spawn relaunch only
     if (!relaunch_requested.load(.acquire)) return;
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     const arena = arena_state.allocator();
