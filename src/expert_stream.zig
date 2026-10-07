@@ -722,7 +722,8 @@ pub const ExpertStore = struct {
                 const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
                 if (fd < 0) return error.MissingExpertShard;
                 errdefer _ = std.c.close(fd);
-                _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+                // F_NOCACHE is darwin-only; Linux streams shards through the page cache.
+                if (comptime @import("builtin").os.tag == .macos) _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
                 const owned_name = try a.dupe(u8, name);
                 errdefer a.free(owned_name);
                 try list.append(a, .{ .name = owned_name, .fd = fd });
