@@ -1911,7 +1911,7 @@ fn indexedPairCoopF16(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, t
     const xs = mlx.getShape(xg);
     const ts = mlx.getShape(tg);
     const ss = mlx.getShape(slots);
-    if (!mlx.streamIsGpu(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
+    if (!mlx.streamIsMetal(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
         !std.mem.eql(c_int, xs, mlx.getShape(xu)) or !std.mem.eql(c_int, ts, mlx.getShape(tu)) or
         xs[0] <= 0 or xs[1] <= 0 or ts[0] <= 0 or ts[1] <= 0 or ts[2] <= 0 or
         ts[1] > std.math.maxInt(c_int) / 16 or ts[2] > std.math.maxInt(c_int) / 128 or
@@ -2934,6 +2934,24 @@ pub fn moeSwigluFusedWithShared(
     out_dtype: mlx.mlx_dtype,
     shared: ?mlx.mlx_array,
 ) !mlx.mlx_array {
+    if (!mlx.streamIsMetal(s)) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const xsh_n = mlx.getShape(x);
+        const inter_n: c_int = mlx.getShape(gate_t)[2] * 16;
+        const hidden_n: c_int = if (xsh_n.len == 1) xsh_n[0] else xsh_n[xsh_n.len - 1];
+        const ssh_n = mlx.getShape(slots);
+        const topk_n: c_int = @divExact(ssh_n[0], if (xsh_n.len == 1) @as(c_int, 1) else xsh_n[0]);
+        var routed = try plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden_n, inter_n, topk_n, 0, out_dtype);
+        if (shared) |value| {
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&out, routed, value, s));
+            _ = mlx.mlx_array_free(routed);
+            routed = out;
+        }
+        return routed;
+    }
     const xsh = mlx.getShape(x);
     const ssh = mlx.getShape(slots);
     const tsh = mlx.getShape(gate_t);
@@ -2999,6 +3017,222 @@ pub fn moeSwigluFusedWithShared(
         }
     }
     return out;
+}
+
+/// Plain-MLX-op fallback for the custom-metal fused SwiGLU MoE path. The Metal
+/// backend declines for every fast-path kernel here (see the `streamIsMetal`
+/// gates on `indexedPairCoopF16`, `clampedMiddleDownCoop`, `lanePairCoop`,
+/// `laneClampedPair`); on those streams this is the chain. Each routed
+/// expert's trellis is decoded on the host with `reconstructPublic` — the
+/// same call the unit-test fixtures certify — and the per-slot matmuls run
+/// over the dequantized f16 weights via `mlx_matmul`. Slow by design; the
+/// contract asks for correct, not fast, on non-Metal.
+fn plainMoeFused(
+    alloc: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots_u: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const ssh = mlx.getShape(slots_u);
+    const rows: c_int = if (xsh.len == 1) 1 else xsh[0];
+    const nslots: c_int = ssh[0];
+    if (nslots <= 0 or nslots > 4096) return error.Exl3TopkUnsupported;
+    if (rows != 1 and nslots != rows * topk) return error.BadExl3Shape;
+    const x_size: usize = @intCast(if (xsh.len == 1) xsh[0] else xsh[0] * xsh[1]);
+    if (x_size > 16 * 4096) return error.BadExl3Shape;
+
+    try mlx.check(mlx.mlx_array_eval(slots_u));
+    const slots_ptr = mlx.mlx_array_data_uint32(slots_u) orelse return error.UnreadableExl3Output;
+    const slots_heap = try alloc.alloc(u32, @intCast(nslots));
+    defer alloc.free(slots_heap);
+    const nslots_u: usize = @intCast(nslots);
+    @memcpy(slots_heap, slots_ptr[0..nslots_u]);
+    const slots_slice = slots_heap;
+
+    try mlx.check(mlx.mlx_array_eval(x));
+    const xf = try alloc.alloc(f32, x_size);
+    defer alloc.free(xf);
+    if (mlx.mlx_array_data_float32(x)) |p| {
+        @memcpy(xf, p[0..x_size]);
+    } else if (mlx.mlx_array_data_float16(x)) |p| {
+        for (p[0..x_size], 0..) |v, i| xf[i] = exl3.f16BitsToF32(v);
+    } else if (mlx.mlx_array_data_bfloat16(x)) |p| {
+        for (p[0..x_size], 0..) |v, i| xf[i] = @bitCast(@as(u32, v) << 16);
+    } else return error.F32Unreadable;
+
+    const gt = mlx.getShape(gate_t);
+    const E: usize = @intCast(gt[0]);
+    const rate = try packedRate(gt[3]);
+    const dec = active_decode;
+    setDecodeParams(dec);
+
+    try mlx.check(mlx.mlx_array_eval(gate_t));
+    try mlx.check(mlx.mlx_array_eval(up_t));
+    try mlx.check(mlx.mlx_array_eval(down_t));
+    const gate_t_ptr = mlx.mlx_array_data_uint16(gate_t) orelse return error.UnreadableExl3Output;
+    const up_t_ptr = mlx.mlx_array_data_uint16(up_t) orelse return error.UnreadableExl3Output;
+    const down_t_ptr = mlx.mlx_array_data_uint16(down_t) orelse return error.UnreadableExl3Output;
+
+    try mlx.check(mlx.mlx_array_eval(gate_suh));
+    try mlx.check(mlx.mlx_array_eval(gate_svh));
+    try mlx.check(mlx.mlx_array_eval(up_suh));
+    try mlx.check(mlx.mlx_array_eval(up_svh));
+    try mlx.check(mlx.mlx_array_eval(down_suh));
+    try mlx.check(mlx.mlx_array_eval(down_svh));
+    const gate_suh_ptr = mlx.mlx_array_data_float16(gate_suh) orelse return error.UnreadableExl3Output;
+    const gate_svh_ptr = mlx.mlx_array_data_float16(gate_svh) orelse return error.UnreadableExl3Output;
+    const up_suh_ptr = mlx.mlx_array_data_float16(up_suh) orelse return error.UnreadableExl3Output;
+    const up_svh_ptr = mlx.mlx_array_data_float16(up_svh) orelse return error.UnreadableExl3Output;
+    const down_suh_ptr = mlx.mlx_array_data_float16(down_suh) orelse return error.UnreadableExl3Output;
+    const down_svh_ptr = mlx.mlx_array_data_float16(down_svh) orelse return error.UnreadableExl3Output;
+    const gate_suh_bits: [*]const u16 = @ptrCast(gate_suh_ptr);
+    const gate_svh_bits: [*]const u16 = @ptrCast(gate_svh_ptr);
+    const up_suh_bits: [*]const u16 = @ptrCast(up_suh_ptr);
+    const up_svh_bits: [*]const u16 = @ptrCast(up_svh_ptr);
+    const down_suh_bits: [*]const u16 = @ptrCast(down_suh_ptr);
+    const down_svh_bits: [*]const u16 = @ptrCast(down_svh_ptr);
+
+    try mlx.check(mlx.mlx_array_eval(scores));
+    const sc_count: usize = @intCast(nslots);
+    const score_f = try alloc.alloc(f32, sc_count);
+    defer alloc.free(score_f);
+    if (mlx.mlx_array_data_float32(scores)) |p| {
+        @memcpy(score_f, p[0..sc_count]);
+    } else if (mlx.mlx_array_data_float16(scores)) |p| {
+        for (p[0..sc_count], 0..) |v, i| score_f[i] = exl3.f16BitsToF32(v);
+    } else if (mlx.mlx_array_data_bfloat16(scores)) |p| {
+        for (p[0..sc_count], 0..) |v, i| score_f[i] = @bitCast(@as(u32, v) << 16);
+    } else return error.F32Unreadable;
+
+    const tstride_gu: usize = @intCast(gt[1] * gt[2] * rate.halfwords());
+    const tstride_d: usize = tstride_gu;
+
+    const gate_w = try alloc.alloc(u16, @intCast(hidden * inter));
+    defer alloc.free(gate_w);
+    const up_w = try alloc.alloc(u16, @intCast(hidden * inter));
+    defer alloc.free(up_w);
+    const down_w = try alloc.alloc(u16, @intCast(inter * hidden));
+    defer alloc.free(down_w);
+    const acc_f = try alloc.alloc(f32, @intCast(rows * hidden));
+    defer alloc.free(acc_f);
+    @memset(acc_f, 0);
+    var gate_y = try alloc.alloc(f32, @intCast(inter));
+    defer alloc.free(gate_y);
+
+    var decoded: [512]u8 = @splat(0);
+    const hidden_u: usize = @intCast(hidden);
+    const inter_u: usize = @intCast(inter);
+    for (0..nslots_u) |slot| {
+        const e = slots_slice[slot];
+        if (e >= E) return error.SlotOutOfRange;
+        if (decoded[e] == 0) {
+            const g_off = e * tstride_gu;
+            const u_off = e * tstride_gu;
+            const d_off = e * tstride_d;
+            try exl3.reconstructPublic(
+                alloc,
+                gate_t_ptr[g_off..][0..tstride_gu],
+                gate_suh_bits[e * hidden_u ..][0..hidden_u],
+                gate_svh_bits[e * inter_u ..][0..inter_u],
+                hidden_u,
+                inter_u,
+                rate,
+                dec,
+                gate_w,
+            );
+            try exl3.reconstructPublic(
+                alloc,
+                up_t_ptr[u_off..][0..tstride_gu],
+                up_suh_bits[e * hidden_u ..][0..hidden_u],
+                up_svh_bits[e * inter_u ..][0..inter_u],
+                hidden_u,
+                inter_u,
+                rate,
+                dec,
+                up_w,
+            );
+            try exl3.reconstructPublic(
+                alloc,
+                down_t_ptr[d_off..][0..tstride_d],
+                down_suh_bits[e * inter_u ..][0..inter_u],
+                down_svh_bits[e * hidden_u ..][0..hidden_u],
+                inter_u,
+                hidden_u,
+                rate,
+                dec,
+                down_w,
+            );
+            decoded[e] = 1;
+        }
+        const r = slot / @as(usize, @intCast(topk));
+        const x_row = xf[r * hidden_u ..][0..hidden_u];
+        for (0..inter_u) |o| {
+            var ag: f32 = 0;
+            var au: f32 = 0;
+            for (0..hidden_u) |k| {
+                ag += x_row[k] * exl3.f16BitsToF32(gate_w[k * inter_u + o]);
+                au += x_row[k] * exl3.f16BitsToF32(up_w[k * inter_u + o]);
+            }
+            if (limit > 0) {
+                const lim: f32 = @floatFromInt(limit);
+                ag = @min(ag, lim);
+                const amag: f32 = @min(@abs(au), lim);
+                au = if (au < 0.0) -amag else amag;
+            }
+            const sig = @as(f32, 1.0) / (1.0 + @exp(-ag));
+            const silu = ag * sig;
+            gate_y[o] = silu * au;
+        }
+        for (0..hidden_u) |o| {
+            var ad: f32 = 0;
+            for (0..inter_u) |k| ad += gate_y[k] * exl3.f16BitsToF32(down_w[k * hidden_u + o]);
+            acc_f[r * hidden_u + o] += score_f[slot] * ad;
+        }
+    }
+
+    const out_count: usize = @intCast(rows * hidden);
+    // The buffer has to outlive the returned MLX array, and the C destructor
+    // MLX will call cannot see the arena allocator. Hand the buffer (and a
+    // payload describing its size) to MLX with a destructor that frees both
+    // via the page allocator — the only allocator reachable from the C ABI.
+    const out_bits = try std.heap.page_allocator.alloc(u16, out_count);
+    for (acc_f, out_bits) |v, *b| b.* = exl3.f32ToF16Bits(v);
+    const out_shape: [2]c_int = .{ rows, hidden };
+    _ = s;
+    const Payload = struct { ptr: [*]align(2) u16, count: usize };
+    const payload = std.heap.page_allocator.create(Payload) catch return error.OutOfMemory;
+    payload.* = .{ .ptr = @alignCast(out_bits.ptr), .count = out_count };
+    const Dtor = struct {
+        fn run(p: ?*anyopaque) callconv(.c) void {
+            const pl: *Payload = @ptrCast(@alignCast(p orelse return));
+            std.heap.page_allocator.free(pl.ptr[0..pl.count]);
+            std.heap.page_allocator.destroy(pl);
+        }
+    };
+    return mlx.mlx_array_new_data_managed_payload(
+        out_bits.ptr,
+        &out_shape,
+        2,
+        out_dtype,
+        @ptrCast(payload),
+        &Dtor.run,
+    );
 }
 
 pub fn moeSwigluIndexed(
@@ -3097,6 +3331,14 @@ pub fn moePrefill(
     scores: mlx.mlx_array,
     topk: c_int,
 ) !mlx.mlx_array {
+    if (!mlx.streamIsMetal(s)) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const sh_p = mlx.getShape(x);
+        const inter_p: c_int = mlx.getShape(gate_t)[2] * 16;
+        return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, sh_p[1], inter_p, topk, 0, mlx.mlx_array_dtype(x));
+    }
     const xsh = mlx.getShape(x);
     const rows = xsh[0];
     const hidden = xsh[1];
@@ -3175,6 +3417,14 @@ pub fn moeSwigluClamped(
     limit: c_int,
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
+    if (!mlx.streamIsMetal(s)) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const sh_n = mlx.getShape(x);
+        const inter_n: c_int = mlx.getShape(gate_t)[2] * 16;
+        return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, sh_n[1], inter_n, topk, limit, out_dtype);
+    }
     const sh = mlx.getShape(x);
     const rows = sh[0];
     const hidden = sh[1];
@@ -6809,6 +7059,83 @@ fn mimoPrefillMatchesHost(c: MimoMoeCase) !void {
     try expectRelRms(got[0 .. c.rows * c.hidden], want, 0.02);
 }
 
+// The non-Metal plain path answers the same SwiGLU oracle the host and the
+// metal arm do, in the same units. The fixture needs a GPU to host its
+// mlx_array_new_data, so the test skips when none is present.
+test "exl3 plain path matches the host SwiGLU on the decode arm" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const c = MimoMoeCase{
+        .e = 4,
+        .hidden = 128,
+        .inter = 64,
+        .topk = 2,
+        .rows = 1,
+        .rate = .{ .n = 40 },
+        .dec = .{ .codebook = .mcg, .window = .w12 },
+        .seed = 31415,
+    };
+    var f = try mimoMoeFixture(alloc, c);
+    defer f.deinit();
+    const a = f.arrays;
+    setDecodeParams(c.dec);
+    defer setDecodeParams(.mul1);
+    const got = try plainMoeFused(
+        alloc,
+        s,
+        a[8],
+        a[0],
+        a[3],
+        a[4],
+        a[1],
+        a[3],
+        a[4],
+        a[2],
+        a[5],
+        a[6],
+        a[7],
+        a[9],
+        c.hidden,
+        c.inter,
+        c.topk,
+        0,
+        mlx.mlx_array_dtype(a[8]),
+    );
+    defer _ = mlx.mlx_array_free(got);
+    var cg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cg);
+    const got_h = try evalF16(s, got, &cg);
+    var want = try alloc.alloc(f16, c.hidden);
+    defer alloc.free(want);
+    const y = try moeSwigluHost(
+        alloc,
+        f.xf[0..c.hidden],
+        f.gate_t,
+        f.suh_h,
+        f.svh_i,
+        f.up_t,
+        f.suh_h,
+        f.svh_i,
+        f.down_t,
+        f.suh_i,
+        f.svh_h,
+        f.slots[0..c.topk],
+        f.scores[0..c.topk],
+        c.hidden,
+        c.inter,
+        c.rate.halfwords(),
+        c.hidden / 16,
+        c.inter / 16,
+        c.dec,
+    );
+    for (y, 0..) |v, i| want[i] = @floatCast(v);
+    try expectRelRms(got_h[0..c.hidden], want, 0.02);
+}
+
 /// The two arms on the same rows. The decode chain is what MiMo answers
 /// correctly live, so it is the reference at widths the host oracle cannot reach.
 fn mimoArmsAgree(c: MimoMoeCase) !void {
@@ -9920,7 +10247,7 @@ fn clampedMiddleDownCoop(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array
     const x = mlx.getShape(ig);
     const w = mlx.getShape(down);
     const ids = mlx.getShape(slots);
-    if (!mlx.streamIsGpu(s) or x.len != 2 or w.len != 4 or ids.len != 1 or
+    if (!mlx.streamIsMetal(s) or x.len != 2 or w.len != 4 or ids.len != 1 or
         !std.mem.eql(c_int, x, mlx.getShape(iu)) or x[0] != ids[0] or x[0] < 1 or x[1] < 128 or x[1] > 8192 or @mod(x[1], 128) != 0 or
         w[0] < 1 or w[1] < 1 or w[1] > std.math.maxInt(c_int) / 16 or w[1] * 16 != x[1] or w[2] < 1 or w[2] > std.math.maxInt(c_int) / 128 or (tiles != 1 and tiles != 4 and tiles != 8) or @mod(w[2], tiles) != 0 or limit < 1 or limit > 128 or
         mlx.mlx_array_dtype(ig) != .float16 or mlx.mlx_array_dtype(iu) != .float16 or mlx.mlx_array_dtype(down) != .uint16 or
@@ -10084,7 +10411,7 @@ pub fn lanePairCoop(s: mlx.mlx_stream, xg: mlx.mlx_array, xu: mlx.mlx_array, tg:
     const xs = mlx.getShape(xg);
     const ts = mlx.getShape(tg);
     const ss = mlx.getShape(slots);
-    if (!mlx.streamIsGpu(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
+    if (!mlx.streamIsMetal(s) or xs.len != 2 or ts.len != 4 or ss.len != 1 or
         !std.mem.eql(c_int, xs, mlx.getShape(xu)) or !std.mem.eql(c_int, ts, mlx.getShape(tu)) or
         xs[0] <= 0 or xs[1] <= 0 or ts[0] <= 0 or ts[1] <= 0 or ts[2] <= 0 or
         ts[1] > std.math.maxInt(c_int) / 16 or ts[2] > std.math.maxInt(c_int) / 128 or
@@ -10160,7 +10487,7 @@ pub const PrefillGridSupport = struct {
 
 var lane_decode_dispatches: usize = 0;
 fn laneClampedPair(s: mlx.mlx_stream, x: mlx.mlx_array, tg: mlx.mlx_array, tu: mlx.mlx_array, sg: mlx.mlx_array, su: mlx.mlx_array, slots: mlx.mlx_array, hidden: c_int, rows: c_int, topk: c_int) !?[2]mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or active_decode.codebook != .mcg or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
+    if (!mlx.streamIsMetal(s) or active_decode.codebook != .mcg or mlx.mlx_array_dtype(x) != .bfloat16 or rows < 1 or rows > 16 or hidden < 128 or @mod(hidden, 128) != 0) return null;
     const gs = mlx.getShape(tg);
     if (gs.len != 4 or !std.mem.eql(c_int, gs, mlx.getShape(tu)) or gs[3] < 32 or gs[3] > 64 or @mod(gs[3], 2) != 0) return null;
     const prepared = try lanePairPrepare(s, x, sg, su, slots, null, hidden, rows * topk, topk);

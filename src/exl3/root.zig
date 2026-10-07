@@ -106,7 +106,15 @@ fn moeOutputClamped(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.m
     const g = bank.gate;
     const u = bank.up;
     const d = bank.down;
-    const y = if (limit > 0)
+    // On non-Metal streams the inner metal-kernel fast paths in
+    // moeSwigluFused / moePrefill / moeMixedDecode all decline; route every
+    // shape through moeSwigluClamped, which has a non-Metal plain path
+    // (`plainMoeFused` in expert_exl3_kernels.zig) and works for any rate
+    // combination. limit=0 is the no-clamp case; the plain path skips clamp
+    // when limit==0, matching the unclamped metal body.
+    const y = if (!mlx.streamIsMetal(s))
+        try kernels.moeSwigluClamped(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd)
+    else if (limit > 0)
         try kernels.moeSwigluClamped(s, x2, g.trellis, g.suh, g.svh, u.trellis, u.suh, u.svh, d.trellis, d.suh, d.svh, slots_u, sc, K, limit, xd)
     else if (rows <= kernels.DECODE_ROWS_MAX or verify_rows)
         if (mlx.getShape(g.trellis)[3] == mlx.getShape(u.trellis)[3])
@@ -539,7 +547,9 @@ test "GLM clamped EXL3 rejects malformed banks before kernel dispatch" {
     }
 }
 
-test { _ = glm_group2; }
+test {
+    _ = glm_group2;
+}
 
 test {
     _ = glm_prefill_grid;

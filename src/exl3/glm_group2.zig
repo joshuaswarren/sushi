@@ -203,7 +203,7 @@ pub fn project(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduct
     return projectLayout(s, x, bank, ids, reduction, .natural);
 }
 pub fn projectLayout(s: mlx.mlx_stream, x: Arr, bank: Arr, ids: Arr, reduction: Reduction, layout: Layout) !?Arr {
-    if (!mlx.streamIsGpu(s) or !eligible(x, bank, ids)) return null;
+    if (!mlx.streamIsMetal(s) or !eligible(x, bank, ids)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(bank);
     const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = false, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
@@ -225,7 +225,7 @@ pub fn pair(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Arr, red
     return pairLayout(s, xg, xu, tg, tu, ids, reduction, .natural);
 }
 pub fn pairLayout(s: mlx.mlx_stream, xg: Arr, xu: Arr, tg: Arr, tu: Arr, ids: Arr, reduction: Reduction, layout: Layout) !?[2]Arr {
-    if (!mlx.streamIsGpu(s) or !eligible(xg, tg, ids) or !eligible(xu, tu, ids) or !std.mem.eql(c_int, mlx.getShape(tg), mlx.getShape(tu)) or !std.mem.eql(c_int, mlx.getShape(xg), mlx.getShape(xu))) return null;
+    if (!mlx.streamIsMetal(s) or !eligible(xg, tg, ids) or !eligible(xu, tu, ids) or !std.mem.eql(c_int, mlx.getShape(tg), mlx.getShape(tu)) or !std.mem.eql(c_int, mlx.getShape(xg), mlx.getShape(xu))) return null;
     const xs = mlx.getShape(xg);
     const ws = mlx.getShape(tg);
     const cfg = try config(.{ .input = xs[1], .output = ws[2] * 16, .slots = xs[0], .rate = ws[3], .paired = true, .reduction = reduction, .tiles = if (layout == .lane and xs[0] == 24) 2 else 1 });
@@ -252,7 +252,7 @@ pub fn moe(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: A
     return moeLayout(s, x, bank, indices, scores, dec, reduction, down, .natural);
 }
 pub fn moeLayout(s: mlx.mlx_stream, x: Arr, bank: @import("root.zig").Bank, indices: Arr, scores: Arr, dec: @import("expert_exl3.zig").Decode, reduction: Reduction, down: Down, layout: Layout) !?Arr {
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |value| if (value.ctx == null) return null;
     const shape = mlx.getShape(x);
     const ids_shape = mlx.getShape(indices);

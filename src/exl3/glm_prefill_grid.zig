@@ -59,7 +59,7 @@ fn project(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, x: Arr, bank: A
 }
 fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr) bool {
     for ([_]Arr{ x, indices, scores, bank.gate.trellis, bank.gate.suh, bank.gate.svh, bank.up.trellis, bank.up.suh, bank.up.svh, bank.down.trellis, bank.down.suh, bank.down.svh }) |a| if (a.ctx == null) return false;
-    if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 2048, 4096 }) or !std.mem.eql(c_int, mlx.getShape(indices), &.{ 1, 2048, 8 }) or !std.mem.eql(c_int, mlx.getShape(scores), &.{ 1, 2048, 8 }) or mlx.mlx_array_dtype(indices) != .uint32 or mlx.mlx_array_dtype(scores) != .float32) return false;
+    if (!mlx.streamIsMetal(s) or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, 2048, 4096 }) or !std.mem.eql(c_int, mlx.getShape(indices), &.{ 1, 2048, 8 }) or !std.mem.eql(c_int, mlx.getShape(scores), &.{ 1, 2048, 8 }) or mlx.mlx_array_dtype(indices) != .uint32 or mlx.mlx_array_dtype(scores) != .float32) return false;
     inline for (.{ .{ "gate", 4096, 2048 }, .{ "up", 4096, 2048 }, .{ "down", 2048, 4096 } }) |entry| {
         const p = @field(bank, entry[0]);
         api.validateClampedProjection(p, 288, entry[1], entry[2]) catch return false;
