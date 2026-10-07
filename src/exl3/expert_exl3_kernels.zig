@@ -3019,6 +3019,21 @@ pub fn moeSwigluFusedWithShared(
     return out;
 }
 
+/// `x[from:to]` on axis 0 (contiguous rows), rank-preserving up to rank 4.
+fn sliceRows(x: mlx.mlx_array, from: c_int, to: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    var start: [4]c_int = @splat(0);
+    var stop: [4]c_int = @splat(0);
+    const strides: [4]c_int = @splat(1);
+    for (sh, 0..) |d, i| stop[i] = d;
+    start[0] = from;
+    stop[0] = to;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, x, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
+    return out;
+}
+
 /// Plain-MLX-op fallback for the custom-metal fused SwiGLU MoE path. The Metal
 /// backend declines for every fast-path kernel here (see the `streamIsMetal`
 /// gates on `indexedPairCoopF16`, `clampedMiddleDownCoop`, `lanePairCoop`,
@@ -3423,7 +3438,34 @@ pub fn moeSwigluClamped(
         const alloc = arena.allocator();
         const sh_n = mlx.getShape(x);
         const inter_n: c_int = mlx.getShape(gate_t)[2] * 16;
-        return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, sh_n[1], inter_n, topk, limit, out_dtype);
+        // plainMoeFused is a host loop bounded to 16*4096 elements of x;
+        // serve wide prefills in row chunks within that cap (decode stays
+        // one chunk). Chunks are row-independent, so results are identical.
+        const rows_n: c_int = if (sh_n.len == 1) 1 else sh_n[0];
+        const dim_n: c_int = if (sh_n.len == 1) sh_n[0] else sh_n[1];
+        const chunk_rows: c_int = @max(1, @divTrunc(16 * 4096, @max(dim_n, 1)));
+        if (rows_n <= chunk_rows)
+            return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
+        const parts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(parts);
+        var r0: c_int = 0;
+        while (r0 < rows_n) : (r0 += chunk_rows) {
+            const r1: c_int = @min(r0 + chunk_rows, rows_n);
+            const xc = try sliceRows(x, r0, r1, s);
+            defer _ = mlx.mlx_array_free(xc);
+            const slot_c = try sliceRows(slots, r0 * topk, r1 * topk, s);
+            defer _ = mlx.mlx_array_free(slot_c);
+            const score_c = try sliceRows(scores, r0 * topk, r1 * topk, s);
+            defer _ = mlx.mlx_array_free(score_c);
+            const yc = try plainMoeFused(alloc, s, xc, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slot_c, score_c, dim_n, inter_n, topk, limit, out_dtype);
+            errdefer _ = mlx.mlx_array_free(yc);
+            try mlx.check(mlx.mlx_vector_array_append_value(parts, yc));
+            _ = mlx.mlx_array_free(yc);
+        }
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_concatenate_axis(&y, parts, 0, s));
+        return y;
     }
     const sh = mlx.getShape(x);
     const rows = sh[0];
