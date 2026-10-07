@@ -680,10 +680,10 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
         var b_t4 = try reshapeTo(b_t, &.{ b, hv, 1, 1 }, s);
         defer release(&b_t4);
 
-        const step = try serialStep(st, q_t, k_t, v_t1, g_t4, b_t4, s);
-        release(&step.y); // squeezed below from the [.,.,.,1] form
+        const cur = try serialStep(st, q_t, k_t, v_t1, g_t4, b_t4, s);
+        release(&cur.y); // squeezed below from the [.,.,.,1] form
         if (st_owned) release(&st) else st_owned = true;
-        st = step.st;
+        st = cur.st;
 
         // state_out is bf16 (as the kernel writes it); reload for the next step.
         var st_b = try make1(mlx.mlx_astype, st, s);
