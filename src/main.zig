@@ -604,7 +604,10 @@ pub fn main(init: std.process.Init) !void {
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_sha = build_options.mlx_sha,
                 .mlx_c_sha = build_options.mlx_c_version,
-                .min_macos = @import("builtin").os.version_range.semver.min,
+                .min_macos = if (comptime @import("builtin").os.tag == .macos)
+                    @import("builtin").os.version_range.semver.min
+                else
+                    .{ .major = 0, .minor = 0, .patch = 0 },
             });
             try out_w.interface.flush();
             return;

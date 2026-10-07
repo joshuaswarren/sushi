@@ -635,11 +635,9 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
     const b = qsh[0];
     const t = qsh[1];
     const hk = qsh[2];
-    const dk = qsh[3];
     const vsh = mlx.getShape(in.v);
     if (vsh.len != 4 or vsh[0] != b or vsh[1] != t) return error.GdnPlainShape;
     const hv = vsh[2];
-    const dv = vsh[3];
     const grp = @divExact(hv, hk);
 
     var qh = try headsMajor(in.q, s); // [B,Hk,T,Dk]
@@ -656,9 +654,9 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
     var st_owned = true;
     defer if (st_owned) release(&st);
 
-    var y_parts = mlx.mlx_vector_array_new();
+    const y_parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(y_parts);
-    var seq_parts = mlx.mlx_vector_array_new();
+    const seq_parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(seq_parts);
 
     for (0..@intCast(t)) |ti| {
@@ -688,7 +686,7 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
         // state_out is bf16 (as the kernel writes it); reload for the next step.
         var st_b = try make1(mlx.mlx_astype, st, s);
         defer release(&st_b);
-        var reloaded = try make1(mlx.mlx_astype, st_b, s);
+        const reloaded = try make1(mlx.mlx_astype, st_b, s);
         release(&st);
         st = reloaded;
 
