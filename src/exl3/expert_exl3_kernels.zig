@@ -3071,7 +3071,7 @@ fn plainMoeFused(
     if (mlx.mlx_array_data_float32(x)) |p| {
         @memcpy(xf, p[0..x_size]);
     } else if (mlx.mlx_array_data_float16(x)) |p| {
-        for (p[0..x_size], 0..) |v, i| xf[i] = exl3.f16BitsToF32(v);
+        for (p[0..x_size], 0..) |v, i| xf[i] = @floatCast(v);
     } else if (mlx.mlx_array_data_bfloat16(x)) |p| {
         for (p[0..x_size], 0..) |v, i| xf[i] = @bitCast(@as(u32, v) << 16);
     } else return error.F32Unreadable;
