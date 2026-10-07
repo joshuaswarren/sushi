@@ -28,6 +28,8 @@ var hint_failure_logged: bool = false;
 
 pub fn applyReadHints(fd: std.c.fd_t, hints: ReadHints) void {
     var failed = false;
+    // F_NOCACHE/F_RDAHEAD are darwin-only; Linux reads go through the page cache.
+    if (comptime @import("builtin").os.tag != .macos) return;
     const want: c_int = if (hints.nocache) 1 else 0;
     if (std.c.fcntl(fd, std.c.F.NOCACHE, want) != 0) failed = true;
     if (hints.readahead_off and std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0) failed = true;

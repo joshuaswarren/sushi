@@ -894,7 +894,8 @@ pub const Bf16NgramStore = struct {
                 const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
                 if (fd < 0) return error.MissingNgramShard;
                 errdefer _ = std.c.close(fd);
-                _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+                // F_NOCACHE is darwin-only; Linux streams shards through the page cache.
+                if (comptime @import("builtin").os.tag == .macos) _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
                 const name = try allocator.dupe(u8, mapped.string);
                 errdefer allocator.free(name);
                 try files_list.append(allocator, .{ .name = name, .fd = fd });
