@@ -3138,105 +3138,176 @@ fn plainMoeFused(
     } else return error.F32Unreadable;
 
     const tstride_gu: usize = @as(usize, @intCast(gt[1])) * @as(usize, @intCast(gt[2])) * rate.halfwords();
-    const tstride_d: usize = tstride_gu;
 
-    const gate_w = try alloc.alloc(u16, @intCast(hidden * inter));
-    defer alloc.free(gate_w);
-    const up_w = try alloc.alloc(u16, @intCast(hidden * inter));
-    defer alloc.free(up_w);
-    const down_w = try alloc.alloc(u16, @intCast(inter * hidden));
-    defer alloc.free(down_w);
     const acc_f = try alloc.alloc(f32, @intCast(rows * hidden));
     defer alloc.free(acc_f);
     @memset(acc_f, 0);
-    var gate_y = try alloc.alloc(f32, @intCast(inter));
-    defer alloc.free(gate_y);
-    const ag_buf = try alloc.alloc(f32, @intCast(inter));
-    defer alloc.free(ag_buf);
-    const au_buf = try alloc.alloc(f32, @intCast(inter));
-    defer alloc.free(au_buf);
-
-    var decoded: [512]u8 = @splat(0);
     const hidden_u: usize = @intCast(hidden);
     const inter_u: usize = @intCast(inter);
-    for (0..nslots_u) |slot| {
-        const e = slots_slice[slot];
-        if (e >= E) return error.SlotOutOfRange;
-        if (decoded[e] == 0) {
-            const g_off = e * tstride_gu;
-            const u_off = e * tstride_gu;
-            const d_off = e * tstride_d;
-            try exl3.reconstructPublic(
-                alloc,
-                gate_t_ptr[g_off..][0..tstride_gu],
-                gate_suh_bits[e * hidden_u ..][0..hidden_u],
-                gate_svh_bits[e * inter_u ..][0..inter_u],
-                hidden_u,
-                inter_u,
-                rate,
-                dec,
-                gate_w,
-            );
-            try exl3.reconstructPublic(
-                alloc,
-                up_t_ptr[u_off..][0..tstride_gu],
-                up_suh_bits[e * hidden_u ..][0..hidden_u],
-                up_svh_bits[e * inter_u ..][0..inter_u],
-                hidden_u,
-                inter_u,
-                rate,
-                dec,
-                up_w,
-            );
-            try exl3.reconstructPublic(
-                alloc,
-                down_t_ptr[d_off..][0..tstride_d],
-                down_suh_bits[e * inter_u ..][0..inter_u],
-                down_svh_bits[e * hidden_u ..][0..hidden_u],
-                inter_u,
-                hidden_u,
-                rate,
-                dec,
-                down_w,
-            );
-            decoded[e] = 1;
-        }
-        const r = slot / @as(usize, @intCast(topk));
-        const x_row = xf[r * hidden_u ..][0..hidden_u];
-        // Row-major weight walk: the inner loop streams contiguous memory and
-        // auto-vectorizes; the previous per-output strided walk did not.
-        // Same sums, different accumulation order.
-        @memset(ag_buf[0..inter_u], 0);
-        @memset(au_buf[0..inter_u], 0);
-        for (0..hidden_u) |k| {
-            const xv = x_row[k];
-            const gw = gate_w[k * inter_u ..][0..inter_u];
-            const uw = up_w[k * inter_u ..][0..inter_u];
-            for (0..inter_u) |o| {
-                ag_buf[o] += xv * exl3.f16BitsToF32(gw[o]);
-                au_buf[o] += xv * exl3.f16BitsToF32(uw[o]);
+    const rows_u: usize = @intCast(rows);
+
+    // Rows are independent (disjoint acc slices; weights/x read-only), so the
+    // host loop parallelizes over row ranges. Each worker owns its dequant
+    // cache + weight buffers; the per-call arena stays on the main thread.
+    const WorkerCtx = struct {
+        xf: []const f32,
+        slots: []const u32,
+        scores: []const f32,
+        gate_t_ptr: [*]const u16,
+        up_t_ptr: [*]const u16,
+        down_t_ptr: [*]const u16,
+        gate_suh: [*]const u16,
+        gate_svh: [*]const u16,
+        up_suh: [*]const u16,
+        up_svh: [*]const u16,
+        down_suh: [*]const u16,
+        down_svh: [*]const u16,
+        gate_w: []u16,
+        up_w: []u16,
+        down_w: []u16,
+        ag: []f32,
+        au: []f32,
+        gy: []f32,
+        acc: []f32,
+        decoded: [512]u8,
+        hidden: usize,
+        inter: usize,
+        topk: usize,
+        experts: usize,
+        tstride: usize,
+        limit: c_int,
+        rate: @TypeOf(rate),
+        dec: @TypeOf(dec),
+        row0: usize,
+        row1: usize,
+        err: c_int,
+    };
+    const workerRun = struct {
+        fn run(w: *WorkerCtx) void {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const walloc = arena.allocator();
+            const su: usize = w.hidden;
+            const sv: usize = w.inter;
+            var r = w.row0;
+            while (r < w.row1) : (r += 1) {
+                const x_row = w.xf[r * w.hidden ..][0..w.hidden];
+                const acc_row = w.acc[r * w.hidden ..][0..w.hidden];
+                for (0..w.topk) |j| {
+                    const slot = r * w.topk + j;
+                    const e: usize = w.slots[slot];
+                    if (e >= w.experts) {
+                        w.err = 1;
+                        return;
+                    }
+                    if (w.decoded[e] == 0) {
+                        const off = e * w.tstride;
+                        exl3.reconstructPublic(walloc, w.gate_t_ptr[off..][0..w.tstride], w.gate_suh[e * su ..][0..su], w.gate_svh[e * sv ..][0..sv], w.hidden, w.inter, w.rate, w.dec, w.gate_w) catch {
+                            w.err = 2;
+                            return;
+                        };
+                        exl3.reconstructPublic(walloc, w.up_t_ptr[off..][0..w.tstride], w.up_suh[e * su ..][0..su], w.up_svh[e * sv ..][0..sv], w.hidden, w.inter, w.rate, w.dec, w.up_w) catch {
+                            w.err = 2;
+                            return;
+                        };
+                        exl3.reconstructPublic(walloc, w.down_t_ptr[off..][0..w.tstride], w.down_suh[e * sv ..][0..sv], w.down_svh[e * su ..][0..su], w.inter, w.hidden, w.rate, w.dec, w.down_w) catch {
+                            w.err = 2;
+                            return;
+                        };
+                        w.decoded[e] = 1;
+                    }
+                    const score = w.scores[slot];
+                    // Row-major weight walk: the inner loop streams contiguous
+                    // memory and auto-vectorizes. Same sums, different
+                    // accumulation order than a per-output walk.
+                    @memset(w.ag, 0);
+                    @memset(w.au, 0);
+                    for (0..w.hidden) |k| {
+                        const xv = x_row[k];
+                        const gw = w.gate_w[k * w.inter ..][0..w.inter];
+                        const uw = w.up_w[k * w.inter ..][0..w.inter];
+                        for (0..w.inter) |o| {
+                            w.ag[o] += xv * exl3.f16BitsToF32(gw[o]);
+                            w.au[o] += xv * exl3.f16BitsToF32(uw[o]);
+                        }
+                    }
+                    for (0..w.inter) |o| {
+                        var ag = w.ag[o];
+                        var au = w.au[o];
+                        if (w.limit > 0) {
+                            const lim: f32 = @floatFromInt(w.limit);
+                            ag = @min(ag, lim);
+                            const amag: f32 = @min(@abs(au), lim);
+                            au = if (au < 0.0) -amag else amag;
+                        }
+                        const sig = @as(f32, 1.0) / (1.0 + @exp(-ag));
+                        w.gy[o] = (ag * sig) * au;
+                    }
+                    // Score weights each expert's output contribution.
+                    for (w.gy) |*g| g.* *= score;
+                    for (0..w.inter) |k| {
+                        const gy = w.gy[k];
+                        const dw = w.down_w[k * w.hidden ..][0..w.hidden];
+                        for (0..w.hidden) |o| acc_row[o] += gy * exl3.f16BitsToF32(dw[o]);
+                    }
+                }
             }
         }
-        for (0..inter_u) |o| {
-            var ag = ag_buf[o];
-            var au = au_buf[o];
-            if (limit > 0) {
-                const lim: f32 = @floatFromInt(limit);
-                ag = @min(ag, lim);
-                const amag: f32 = @min(@abs(au), lim);
-                au = if (au < 0.0) -amag else amag;
-            }
-            const sig = @as(f32, 1.0) / (1.0 + @exp(-ag));
-            const silu = ag * sig;
-            gate_y[o] = silu * au;
-        }
-        const acc_row = acc_f[r * hidden_u ..][0..hidden_u];
-        for (0..inter_u) |k| {
-            const gy = gate_y[k];
-            const dw = down_w[k * hidden_u ..][0..hidden_u];
-            for (0..hidden_u) |o| acc_row[o] += gy * exl3.f16BitsToF32(dw[o]);
+    }.run;
+
+    var nthreads: usize = @min(std.Thread.getCpuCount() catch 1, 8);
+    if (nthreads > rows_u) nthreads = rows_u;
+    if (nthreads < 1) nthreads = 1;
+    const per_thread = (rows_u + nthreads - 1) / nthreads;
+    const workers = try alloc.alloc(WorkerCtx, nthreads);
+    const joins = try alloc.alloc(std.Thread, nthreads);
+    var started: usize = 0;
+    for (workers, 0..) |*w, ti| {
+        const row0 = ti * per_thread;
+        w.* = .{
+            .xf = xf,
+            .slots = slots_slice,
+            .scores = score_f,
+            .gate_t_ptr = gate_t_ptr,
+            .up_t_ptr = up_t_ptr,
+            .down_t_ptr = down_t_ptr,
+            .gate_suh = gate_suh_bits,
+            .gate_svh = gate_svh_bits,
+            .up_suh = up_suh_bits,
+            .up_svh = up_svh_bits,
+            .down_suh = down_suh_bits,
+            .down_svh = down_svh_bits,
+            .gate_w = try alloc.alloc(u16, hidden_u * inter_u),
+            .up_w = try alloc.alloc(u16, hidden_u * inter_u),
+            .down_w = try alloc.alloc(u16, hidden_u * inter_u),
+            .ag = try alloc.alloc(f32, inter_u),
+            .au = try alloc.alloc(f32, inter_u),
+            .gy = try alloc.alloc(f32, inter_u),
+            .acc = acc_f,
+            .decoded = @splat(0),
+            .hidden = hidden_u,
+            .inter = inter_u,
+            .topk = @intCast(topk),
+            .experts = E,
+            .tstride = tstride_gu,
+            .limit = limit,
+            .rate = rate,
+            .dec = dec,
+            .row0 = row0,
+            .row1 = @min(row0 + per_thread, rows_u),
+            .err = 0,
+        };
+        if (w.row0 >= w.row1) continue;
+        if (std.Thread.spawn(.{}, workerRun, .{w})) |t| {
+            joins[started] = t;
+            started += 1;
+        } else |_| {
+            workerRun(w); // fall back to inline on spawn failure
         }
     }
+    for (joins[0..started]) |t| t.join();
+    for (workers) |*w| if (w.err == 1) return error.SlotOutOfRange;
+    for (workers) |*w| if (w.err == 2) return error.Exl3DecodeFailed;
 
     const out_count: usize = @intCast(rows * hidden);
     // The buffer has to outlive the returned MLX array, and the C destructor
