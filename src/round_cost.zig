@@ -18,6 +18,7 @@
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const transformer_mod = @import("transformer.zig");
@@ -1043,9 +1044,7 @@ pub fn fileFingerprint(path: []const u8) ?u64 {
     const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return null;
-    const size: u64 = @intCast(@max(st.size, 0));
+    const size: u64 = io_util.fdSize(fd) catch return null;
     var h = std.hash.Fnv1a_64.init();
     h.update(std.mem.asBytes(&size));
     const win: u64 = 65536;

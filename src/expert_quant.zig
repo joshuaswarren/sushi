@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const io_mod = @import("expert_io.zig");
 pub const expert_exl3 = @import("sushi_exl3").format;
 
@@ -1154,13 +1155,13 @@ fn cacheSourceHeader(allocator: std.mem.Allocator, file: *SourceFile) !void {
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSafetensorsHeader;
 
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(file.fd, &st) != 0 or st.size < 0) return error.InvalidSafetensorsHeader;
+    const st_size = io_util.fdSize(file.fd) catch return error.InvalidSafetensorsHeader;
     const data_offset = std.math.add(u64, 8, header_len) catch return error.InvalidSafetensorsHeader;
+    if (st_size < data_offset) return error.InvalidSafetensorsHeader;
     file.header = .{
         .parsed = parsed,
         .data_offset = data_offset,
-        .file_size = @intCast(st.size),
+        .file_size = @intCast(st_size),
     };
 }
 

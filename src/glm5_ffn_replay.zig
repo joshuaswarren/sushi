@@ -69,8 +69,8 @@ pub fn main(init: std.process.Init) !void {
     defer _ = std.c.close(fd);
     const elements = try std.math.mul(usize, length, @as(usize, cfg.hidden_size) * 4);
     const window_bytes = try std.math.mul(usize, elements, 2);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0 or !std.c.S.ISREG(@intCast(st.mode)) or st.size != try std.math.mul(usize, window_bytes, windows)) return error.InvalidBoundaryLength;
+    const st = io_util.fdStat(fd) catch return error.InvalidBoundaryLength;
+    if (!std.c.S.ISREG(@intCast(st.mode)) or st.size != try std.math.mul(usize, window_bytes, windows)) return error.InvalidBoundaryLength;
     try std.Io.Dir.cwd().createDirPath(io, out);
     var fds: [7]std.c.fd_t = @splat(-1);
     defer for (fds) |handle| {

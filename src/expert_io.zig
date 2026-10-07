@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
@@ -1324,9 +1325,9 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     const end_u: u64 = @intCast(end.integer);
     const bytes = end_u - start_u;
     const data_offset = std.math.add(u64, 8, header_len) catch return error.InvalidSafetensorsTensor;
-    var st: std.c.Stat = undefined;
     const absolute_end = std.math.add(u64, data_offset, end_u) catch return error.InvalidSafetensorsTensor;
-    if (std.c.fstat(fd, &st) != 0 or st.size < 0 or absolute_end > @as(u64, @intCast(st.size))) return error.SafetensorsTensorOutOfBounds;
+    const st_size = io_util.fdSize(fd) catch return error.SafetensorsTensorOutOfBounds;
+    if (absolute_end > st_size) return error.SafetensorsTensorOutOfBounds;
     return .{
         .data_offset = data_offset,
         .tensor_offset = start_u,
@@ -1598,9 +1599,7 @@ test "expert io ssd microbench" {
     var seq_cache = FileCache.init(allocator, .{});
     defer seq_cache.deinit();
     const seq_fd = try seq_cache.get(paths.items[paths.items.len - 1]);
-    var seq_st: std.c.Stat = undefined;
-    _ = std.c.fstat(seq_fd, &seq_st);
-    const shard_size: u64 = @intCast(seq_st.size);
+    const shard_size: u64 = io_util.fdSize(seq_fd) catch 0;
     const run_bytes: u64 = 64 * 1024 * 1024;
     if (shard_size > run_bytes * 4) {
         const runs: usize = @intCast(@min(arm_bytes, shard_size - run_bytes) / run_bytes);

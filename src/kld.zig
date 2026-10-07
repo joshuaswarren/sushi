@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
@@ -1285,9 +1286,7 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         const teacher_fd = std.c.open(logits_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (teacher_fd < 0) return error.TeacherLogitsMissing;
         defer _ = std.c.close(teacher_fd);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(teacher_fd, &st) != 0 or st.size < 0) return error.TeacherLogitsStatFailed;
-        const size: u64 = @intCast(st.size);
+        const size: u64 = io_util.fdSize(teacher_fd) catch return error.TeacherLogitsStatFailed;
         const row_bytes = generated.len * @sizeOf(f32);
         if (row_bytes == 0 or size % row_bytes != 0) return error.TeacherLogitsSizeMismatch;
         const vocab: usize = @intCast(size / row_bytes);

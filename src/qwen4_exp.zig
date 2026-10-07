@@ -236,9 +236,7 @@ pub const NgramTable = struct {
         const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         errdefer _ = std.c.close(fd);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
-        const size: usize = @intCast(st.size);
+        const size: usize = @intCast(try io_util.fdSize(fd));
         const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
         if (size < 8) return error.NgramTableTruncated;

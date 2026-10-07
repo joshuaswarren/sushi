@@ -100,8 +100,12 @@ pub fn build(b: *std.Build) void {
     // The staged MLX library path must precede Homebrew's.
     addMlxLib(b, mod, is_macos);
     _ = addExl3Module(b, mod, target, optimize);
-    // webp include/lib paths (homebrew on macOS, system on Linux)
-    mod.addIncludePath(.{ .cwd_relative = webp_include });
+    // webp include/lib paths (homebrew on macOS, system on Linux). The include
+    // path is native-only: a cross build must not pull host glibc headers into
+    // target C compilation; the webp translate module keeps its own header path.
+    if (target.query.isNative()) {
+        mod.addIncludePath(.{ .cwd_relative = webp_include });
+    }
     if (is_macos) {
         mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     }

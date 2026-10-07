@@ -7,6 +7,31 @@
 
 const std = @import("std");
 
+/// Open-fd stat across macOS and Linux. std.c.fstat is darwin-only in Zig
+/// 0.17 and Linux lost the plain-Stat layout, so the Linux arm goes through
+/// statx on /proc/self/fd.
+pub const FdStat = struct { size: u64, mode: u32, nlink: u64 };
+
+pub fn fdStat(fd: std.c.fd_t) !FdStat {
+    if (comptime @import("builtin").os.tag == .macos) {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return error.FdStatFailed;
+        return .{ .size = @intCast(st.size), .mode = @intCast(st.mode), .nlink = st.nlink };
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const proc_path = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{fd}, 0) catch
+        return error.FdStatFailed;
+    var stx: std.os.linux.Statx = undefined;
+    const linux = std.os.linux;
+    const rc = linux.statx(-100, proc_path.ptr, 0, linux.STATX.BASIC_STATS, &stx);
+    if (rc != 0) return error.FdStatFailed;
+    return .{ .size = stx.size, .mode = stx.mode, .nlink = stx.nlink };
+}
+
+pub fn fdSize(fd: std.c.fd_t) !u64 {
+    return (try fdStat(fd)).size;
+}
+
 /// Seconds since the Unix epoch (wall-clock).
 pub fn nowSecs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toSeconds();
