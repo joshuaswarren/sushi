@@ -2,27 +2,107 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
 
-// ── macOS Mach externs ──
+// ── macOS Mach/IOKit/CoreFoundation ABI ──
+// Declared only on macOS: none of these symbols exist in glibc, and every
+// Linux caller below takes a /proc branch instead. A stray reference from a
+// non-macOS path is a compile error, not a silent link failure.
 
-extern "c" var mach_task_self_: u32;
-extern "c" fn mach_host_self() u32;
-extern "c" fn task_info(task: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
-extern "c" fn host_statistics(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
-extern "c" fn host_statistics64(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
-extern "c" fn host_page_size(host: u32, out: *usize) i32;
-extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+const mac = if (is_macos) struct {
+    extern "c" var mach_task_self_: u32;
+    extern "c" fn mach_host_self() u32;
+    extern "c" fn task_info(task: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
+    extern "c" fn host_statistics(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
+    extern "c" fn host_statistics64(host: u32, flavor: u32, info: [*]i32, cnt: *u32) i32;
+    extern "c" fn host_page_size(host: u32, out: *usize) i32;
+    extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
-// ── IOKit / CoreFoundation externs ──
+    extern "c" fn IOServiceMatching(name: [*:0]const u8) ?*anyopaque;
+    extern "c" fn IOServiceGetMatchingServices(port: u32, matching: ?*anyopaque, iter: *u32) i32;
+    extern "c" fn IOIteratorNext(iter: u32) u32;
+    extern "c" fn IORegistryEntryCreateCFProperties(entry: u32, props: *?*anyopaque, alloc: ?*anyopaque, opts: u32) i32;
+    extern "c" fn IOObjectRelease(obj: u32) i32;
+    extern "c" fn CFDictionaryGetValue(dict: ?*const anyopaque, key: ?*const anyopaque) ?*const anyopaque;
+    extern "c" fn CFStringCreateWithCString(alloc: ?*anyopaque, s: [*:0]const u8, enc: u32) ?*const anyopaque;
+    extern "c" fn CFNumberGetValue(num: ?*const anyopaque, typ: u32, out: *anyopaque) u8;
+    extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+} else struct {};
 
-extern "c" fn IOServiceMatching(name: [*:0]const u8) ?*anyopaque;
-extern "c" fn IOServiceGetMatchingServices(port: u32, matching: ?*anyopaque, iter: *u32) i32;
-extern "c" fn IOIteratorNext(iter: u32) u32;
-extern "c" fn IORegistryEntryCreateCFProperties(entry: u32, props: *?*anyopaque, alloc: ?*anyopaque, opts: u32) i32;
-extern "c" fn IOObjectRelease(obj: u32) i32;
-extern "c" fn CFDictionaryGetValue(dict: ?*const anyopaque, key: ?*const anyopaque) ?*const anyopaque;
-extern "c" fn CFStringCreateWithCString(alloc: ?*anyopaque, s: [*:0]const u8, enc: u32) ?*const anyopaque;
-extern "c" fn CFNumberGetValue(num: ?*const anyopaque, typ: u32, out: *anyopaque) u8;
-extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+// ── Linux /proc readers. Same contract as the Mach queries: 0 = unknown,
+// never "tiny machine". Raw POSIX (std.c), like round_cost's fingerprinting:
+// these run on paths without an io handle. ──
+
+fn openProc(path: []const u8) c_int {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return -1;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    return std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+}
+
+fn readOnce(fd: c_int, buf: []u8) usize {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.read(fd, buf.ptr + got, buf.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return got;
+}
+
+/// First `Field:  <n> kB` line in a /proc file, in bytes. 0 when absent.
+fn procFieldBytes(path: []const u8, field: []const u8) u64 {
+    const fd = openProc(path);
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var buf: [16384]u8 = undefined;
+    var lines = std.mem.splitScalar(u8, buf[0..readOnce(fd, &buf)], '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, field)) continue;
+        const rest = std.mem.trim(u8, line[field.len..], " \t:");
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const kb = std.fmt.parseInt(u64, rest[0..end], 10) catch return 0;
+        return kb * 1024;
+    }
+    return 0;
+}
+
+/// Resident set in MB from /proc/self/status (the footprint we have — Linux
+/// has no phys_footprint).
+fn linuxRssMb() u32 {
+    return @intCast(procFieldBytes("/proc/self/status", "VmRSS") / (1024 * 1024));
+}
+
+var prev_cpu_total: u64 = 0;
+var prev_cpu_idle: u64 = 0;
+
+/// /proc/stat's aggregate cpu line; same first-sample-returns-0 shape as the
+/// Mach tick math below (idle counts iowait, the standard Linux convention).
+fn linuxCpuPct() u32 {
+    const fd = openProc("/proc/stat");
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var buf: [4096]u8 = undefined;
+    const raw = buf[0..readOnce(fd, &buf)];
+    const line_end = std.mem.indexOfScalar(u8, raw, '\n') orelse raw.len;
+    var toks = std.mem.tokenizeScalar(u8, raw[0..line_end], ' ');
+    if (toks.next()) |head| {
+        if (!std.mem.eql(u8, head, "cpu")) return 0;
+    } else return 0;
+    var total: u64 = 0;
+    var idle: u64 = 0;
+    var i: usize = 0;
+    while (toks.next()) |tok| : (i += 1) {
+        const v = std.fmt.parseInt(u64, tok, 10) catch 0;
+        total += v;
+        if (i == 3 or i == 4) idle += v; // idle + iowait
+    }
+    const d_total = total -| prev_cpu_total;
+    const d_idle = idle -| prev_cpu_idle;
+    prev_cpu_total = total;
+    prev_cpu_idle = idle;
+    if (d_total == 0) return 0;
+    return @intCast((d_total - d_idle) * 100 / d_total);
+}
 
 // ── Mach struct layouts (extern = C ABI) ──
 
@@ -102,9 +182,10 @@ var prev_ticks: [4]u64 = @splat(0);
 // ── Public metric helpers ──
 
 pub fn getAppRssMb() u32 {
+    if (comptime !is_macos) return linuxRssMb();
     var info = std.mem.zeroes(TaskBasicInfo);
     var count: u32 = @sizeOf(TaskBasicInfo) / @sizeOf(i32);
-    if (task_info(mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
+    if (mac.task_info(mac.mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
     return @intCast(info.resident_size / (1024 * 1024));
 }
 
@@ -112,9 +193,10 @@ pub fn getAppRssMb() u32 {
 /// resident_size, this includes MLX's Metal/IOKit + compressed memory — the
 /// only figure that reflects a loaded model's true footprint on Apple Silicon.
 pub fn getAppMemFootprintMb() u32 {
+    if (comptime !is_macos) return linuxRssMb();
     var info = std.mem.zeroes(TaskVmInfo);
     var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    if (mac.task_info(mac.mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
     return @intCast(info.phys_footprint / (1024 * 1024));
 }
 
@@ -158,35 +240,41 @@ pub fn getProcAvailableMemBytes() u64 {
     return @intCast(os_proc_available_memory());
 }
 
-/// Total physical RAM (hw.memsize; works on macOS and iOS). 0 on failure.
+/// Total physical RAM (hw.memsize on macOS/iOS; /proc/meminfo MemTotal on
+/// Linux). 0 on failure.
 pub fn getTotalMemBytes() u64 {
+    if (comptime !is_macos) return procFieldBytes("/proc/meminfo", "MemTotal");
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (mac.sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
     return total_mem;
 }
 
-/// Bytes the kernel holds wired right now (Metal's resident buffers among them). 0 on failure.
+/// Bytes the kernel holds wired right now (Metal's resident buffers among
+/// them). 0 on failure. Always 0 on Linux — there is no wired set; callers
+/// treat 0 as unknown (the unwire wait skips itself).
 pub fn getWiredMemBytes() u64 {
+    if (comptime !is_macos) return 0;
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (mac.host_page_size(mac.mach_host_self(), &page) != 0) return 0;
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+    if (mac.host_statistics64(mac.mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
     return @as(u64, vm.wire_count) * page;
 }
 
 pub fn getAvailableMemBytes() u64 {
+    if (comptime !is_macos) return procFieldBytes("/proc/meminfo", "MemAvailable");
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (mac.sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (mac.host_page_size(mac.mach_host_self(), &page) != 0) return 0;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+    if (mac.host_statistics64(mac.mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
     return computeAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, vm.internal_page_count, vm.purgeable_count, page);
 }
@@ -223,16 +311,22 @@ test "computeAvailableBytes counts the resident anon set, not file cache or purg
 }
 
 pub fn getSysMemPct() u32 {
+    if (comptime !is_macos) {
+        const total = procFieldBytes("/proc/meminfo", "MemTotal");
+        const avail = procFieldBytes("/proc/meminfo", "MemAvailable");
+        if (total == 0) return 0;
+        return @intCast((total -| avail) * 100 / total);
+    }
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (mac.sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (mac.host_page_size(mac.mach_host_self(), &page) != 0) return 0;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+    if (mac.host_statistics64(mac.mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
     const used: u64 = (@as(u64, vm.active_count) + vm.wire_count + vm.compressor_page_count) * page;
     if (total_mem == 0) return 0;
@@ -240,9 +334,10 @@ pub fn getSysMemPct() u32 {
 }
 
 pub fn getCpuPct() u32 {
+    if (comptime !is_macos) return linuxCpuPct();
     var info = std.mem.zeroes(CpuLoadInfo);
     var count: u32 = 4;
-    if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;
+    if (mac.host_statistics(mac.mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;
 
     var total: u64 = 0;
     var idle: u64 = 0;
@@ -258,35 +353,34 @@ pub fn getCpuPct() u32 {
 }
 
 pub fn getGpuPct() u32 {
-    // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
-    // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
-    // registry anyway). On iOS we report 0 — the value is only a log-line stat.
+    // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only. On every
+    // other target we report 0 — the value is only a log-line stat.
     if (comptime !is_macos) return 0;
-    const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
+    const matching = mac.IOServiceMatching("AGXAccelerator") orelse return 0;
     var iter: u32 = 0;
-    if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
-    defer _ = IOObjectRelease(iter);
+    if (mac.IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;
+    defer _ = mac.IOObjectRelease(iter);
 
-    const entry = IOIteratorNext(iter);
+    const entry = mac.IOIteratorNext(iter);
     if (entry == 0) return 0;
-    defer _ = IOObjectRelease(entry);
+    defer _ = mac.IOObjectRelease(entry);
 
     var props: ?*anyopaque = null;
-    if (IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
-    defer if (props) |p| CFRelease(p);
+    if (mac.IORegistryEntryCreateCFProperties(entry, &props, null, 0) != 0) return 0;
+    defer if (props) |p| mac.CFRelease(p);
 
     const perf = cfDictGet(props, "PerformanceStatistics") orelse return 0;
     const util = cfDictGet(perf, "Device Utilization %") orelse return 0;
 
     var value: i64 = 0;
-    _ = CFNumberGetValue(util, 4, @ptrCast(&value));
+    _ = mac.CFNumberGetValue(util, 4, @ptrCast(&value));
     return if (value >= 0 and value <= 100) @intCast(value) else 0;
 }
 
 fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque {
-    const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
-    defer CFRelease(key);
-    return CFDictionaryGetValue(dict, key);
+    const key = mac.CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
+    defer mac.CFRelease(key);
+    return mac.CFDictionaryGetValue(dict, key);
 }
 
 test "getAppMemFootprintMb returns a plausible nonzero footprint" {

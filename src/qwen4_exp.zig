@@ -13,6 +13,7 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const expert_stream = @import("expert_stream.zig");
 const log = @import("log.zig");
+const status = @import("status.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -158,11 +159,9 @@ fn ngramCacheLimit() usize {
         var limit: ?usize = null;
     };
     if (S.limit) |limit| return limit;
-    var physical: u64 = 0;
-    if (@import("builtin").os.tag == .macos) {
-        var len: usize = @sizeOf(u64);
-        _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&physical), &len, null, 0);
-    }
+    // Half of physical RAM (hw.memsize / MemTotal): the table rides the page
+    // cache and the mmap must not crowd the resident model.
+    const physical = status.getTotalMemBytes();
     const limit: usize = if (physical == 0) std.math.maxInt(usize) else @intCast(physical / 2);
     S.limit = limit;
     return limit;

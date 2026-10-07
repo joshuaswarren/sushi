@@ -4,17 +4,22 @@ const log = @import("log.zig");
 
 const is_macos = builtin.os.tag == .macos;
 
-// ABI declarations from IOPMLib.h and CoreFoundation.
+// ABI declarations from IOPMLib.h and CoreFoundation, declared only on
+// macOS — the symbols do not exist in glibc, and on Linux inhibit/release
+// are comptime no-ops (setActive returns before acquiring; release is
+// gated on `held`).
 
-extern "c" fn IOPMAssertionCreateWithName(
-    assertion_type: ?*anyopaque,
-    level: u32,
-    name: ?*anyopaque,
-    out_id: *u32,
-) i32;
-extern "c" fn IOPMAssertionRelease(id: u32) i32;
-extern "c" fn CFStringCreateWithCString(alloc: ?*anyopaque, s: [*:0]const u8, encoding: u32) ?*anyopaque;
-extern "c" fn CFRelease(cf: ?*anyopaque) void;
+const pm = if (is_macos) struct {
+    extern "c" fn IOPMAssertionCreateWithName(
+        assertion_type: ?*anyopaque,
+        level: u32,
+        name: ?*anyopaque,
+        out_id: *u32,
+    ) i32;
+    extern "c" fn IOPMAssertionRelease(id: u32) i32;
+    extern "c" fn CFStringCreateWithCString(alloc: ?*anyopaque, s: [*:0]const u8, encoding: u32) ?*anyopaque;
+    extern "c" fn CFRelease(cf: ?*anyopaque) void;
+} else struct {};
 
 const utf8_encoding: u32 = 0x08000100;
 const level_on: u32 = 255;
@@ -61,19 +66,19 @@ pub fn setActive(want: bool) void {
 pub fn release() void {
     if (!held) return;
     held = false;
-    if (comptime is_macos) _ = IOPMAssertionRelease(assertion_id);
+    if (comptime is_macos) _ = pm.IOPMAssertionRelease(assertion_id);
     assertion_id = 0;
     log.debug("[sleep] idle-sleep assertion released\n", .{});
 }
 
 fn acquire() void {
     if (comptime !is_macos) return;
-    const typ = CFStringCreateWithCString(null, assertion_type, utf8_encoding) orelse return;
-    defer CFRelease(typ);
-    const name = CFStringCreateWithCString(null, assertion_name, utf8_encoding) orelse return;
-    defer CFRelease(name);
+    const typ = pm.CFStringCreateWithCString(null, assertion_type, utf8_encoding) orelse return;
+    defer pm.CFRelease(typ);
+    const name = pm.CFStringCreateWithCString(null, assertion_name, utf8_encoding) orelse return;
+    defer pm.CFRelease(name);
     var id: u32 = 0;
-    if (IOPMAssertionCreateWithName(typ, level_on, name, &id) != 0) {
+    if (pm.IOPMAssertionCreateWithName(typ, level_on, name, &id) != 0) {
         broken = true;
         log.warn("[sleep] idle-sleep prevention unavailable; continuing without it\n", .{});
         return;

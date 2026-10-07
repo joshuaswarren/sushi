@@ -3075,9 +3075,14 @@ var wired_limit_read: bool = false;
 pub fn wiredLimitBytes() u64 {
     if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
     if (wired_limit_read) return wired_limit_bytes_cached;
+    if (comptime @import("builtin").os.tag != .macos) {
+        // Linux has no iogpu OID; the wired policy lives in mlx.zig's applyWiredPolicy.
+        wired_limit_read = true;
+        return 0;
+    }
     var v: u32 = 0;
     var len: usize = @sizeOf(u32);
-    wired_limit_bytes_cached = if (sysctlbyname("iogpu.wired_limit_mb", @ptrCast(&v), &len, null, 0) == 0)
+    wired_limit_bytes_cached = if (mac_abi.sysctlbyname("iogpu.wired_limit_mb", @ptrCast(&v), &len, null, 0) == 0)
         @as(u64, v) * 1024 * 1024
     else
         0;
@@ -7481,13 +7486,14 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     return true;
 }
 
-extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+// macOS-only C symbol (glibc has no sysctlbyname; Linux reads /proc instead).
+const mac_abi = if (@import("builtin").os.tag == .macos) struct {
+    extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+} else struct {};
 
 /// Get the Metal max buffer allocation limit (~75% of system unified memory).
 fn getMetalBufferLimit() u64 {
-    var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    const mem = metrics.getTotalMemBytes(); // hw.memsize on macOS, MemTotal on Linux
     if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
     return mem * 75 / 100;
 }
@@ -23167,7 +23173,7 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // The bill and the headroom moved into `prefillAdmissionBill`.
     const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
     const tail = src[start..];
-    const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
+    const end = std.mem.indexOf(u8, tail, "\nconst mac_abi = if (" ++ "@import(\"builtin\").os.tag == .macos)") orelse return error.CallSiteMoved;
     const body = tail[0..end];
     try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
