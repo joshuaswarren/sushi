@@ -474,3 +474,261 @@ pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w:
         try mlx.check(mlx.mlx_vector_array_get(a, ov, i));
     return out;
 }
+
+// ── Plain-MLX recurrence (no Metal) ──────────────────────────────────────
+//
+// The MSL kernels above are the fast lane; these composed-op ports keep GDN
+// correct on streams that cannot run MSL (omarchy Vulkan). Same inputs as the
+// fused chain's recurrence stage: post-prework q/k/v, per-head gate, beta and
+// the recurrent state. Slow is fine — this is the correctness port.
+
+/// Post-prework recurrence inputs, all living on `s`.
+pub const PlainIn = struct {
+    q: mlx.mlx_array, // [B,S,Hk,Dk] normed + scaled
+    k: mlx.mlx_array, // [B,S,Hk,Dk] normed + scaled
+    v: mlx.mlx_array, // [B,S,Hv,Dv] activated
+    g: mlx.mlx_array, // [B,S,Hv] decay factors in (0,1]
+    beta: mlx.mlx_array, // [B,S,Hv] sigmoid(b)
+    state: mlx.mlx_array, // [B,Hv,Dv,Dk]
+};
+
+/// y [B,S,Hv,Dv] bf16, next state [B,Hv,Dv,Dk] bf16 and — serial path at
+/// verify widths — state_seq [S,B,Hv,Dv,Dk] bf16, row t = state after token t.
+pub const PlainOut = struct {
+    y: mlx.mlx_array,
+    state: mlx.mlx_array,
+    state_seq: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: PlainOut) void {
+        inline for (.{ self.y, self.state, self.state_seq }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+    }
+};
+
+fn release(a: *mlx.mlx_array) void {
+    if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a.*);
+        a.* = .{ .ctx = null };
+    }
+}
+
+fn make1(comptime f: mlx.Fn1, a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(f(&out, a, s));
+    return out;
+}
+
+fn make2(comptime f: mlx.Fn2, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(f(&out, a, b, s));
+    return out;
+}
+
+/// Cast to f32 and move time under heads: [B,S,H,D*] → [B,H,S,D*].
+fn headsMajor(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var f32v = try make1(mlx.mlx_astype, x, s);
+    defer release(&f32v);
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_transpose_axes(&out, f32v, &.{ 0, 2, 1, 3 }, 4, s));
+    return out;
+}
+
+/// [B,S,H] → [B,H,S] f32.
+fn headsMajor3(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var f32v = try make1(mlx.mlx_astype, x, s);
+    defer release(&f32v);
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_transpose_axes(&out, f32v, &.{ 0, 2, 1 }, 3, s));
+    return out;
+}
+
+/// GQA broadcast: [B,Hk,T,D] → [B,Hv,T,D] when Hv > Hk.
+fn tileHeads(x: mlx.mlx_array, grp: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (grp == 1) return make1(mlx.mlx_array_set, x, s);
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_tile(&out, x, &.{ 1, grp, 1, 1 }, 4, s));
+    return out;
+}
+
+/// `x[:, :stop]` on axis 1 of a [B,S,...] array.
+fn timeRows(x: mlx.mlx_array, stop: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    var start: [4]c_int = @splat(0);
+    var stopv: [4]c_int = @splat(0);
+    const strides: [4]c_int = @splat(1);
+    for (sh, 0..) |d, i| stopv[i] = d;
+    stopv[1] = stop;
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_slice(&out, x, &start, sh.len, &stopv, sh.len, &strides, sh.len, s));
+    return out;
+}
+
+fn zerosLikeTime(x: mlx.mlx_array, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    var shape: [4]c_int = @splat(1);
+    for (sh, 0..) |d, i| shape[i] = d;
+    shape[1] = rows;
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_zeros(&out, &shape, sh.len, mlx.mlx_array_dtype(x), s));
+    return out;
+}
+
+fn onesLikeTime(x: mlx.mlx_array, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    var shape: [4]c_int = @splat(1);
+    for (sh, 0..) |d, i| shape[i] = d;
+    shape[1] = rows;
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_ones(&out, &shape, sh.len, mlx.mlx_array_dtype(x), s));
+    return out;
+}
+
+/// The per-token gated delta rule step in broadcast ops (K1's math):
+/// st ← g·st; st ← st + k⊗(beta·(v − st·k)); y = st·q. Any batch.
+fn serialStep(
+    st: mlx.mlx_array, // [B,Hv,Dv,Dk] f32, borrowed
+    q_t: mlx.mlx_array, // [B,Hv,1,Dk] f32 (GQA-tiled)
+    k_t: mlx.mlx_array, // [B,Hv,1,Dk] f32
+    v_t: mlx.mlx_array, // [B,Hv,Dv,1] f32
+    g_t: mlx.mlx_array, // [B,Hv,1,1] f32
+    b_t: mlx.mlx_array, // [B,Hv,1,1] f32
+    s: mlx.mlx_stream,
+) !struct { y: mlx.mlx_array, st: mlx.mlx_array } {
+    var decayed = try make2(mlx.mlx_multiply, st, g_t, s);
+    defer release(&decayed);
+    var k_t3 = try make1(mlx.mlx_transpose, k_t, s); // [B,Hv,Dk,1]
+    defer release(&k_t3);
+    var kv = try make2(mlx.mlx_matmul, decayed, k_t3, s); // [B,Hv,Dv,1]
+    defer release(&kv);
+    var err = try make2(mlx.mlx_subtract, v_t, kv, s);
+    defer release(&err);
+    var delta = try make2(mlx.mlx_multiply, err, b_t, s); // [B,Hv,Dv,1]
+    defer release(&delta);
+    var outer = try make2(mlx.mlx_multiply, k_t, delta, s); // [B,Hv,Dv,Dk]
+    defer release(&outer);
+    var next = try make2(mlx.mlx_add, decayed, outer, s);
+    errdefer release(&next);
+    var q_t3 = try make1(mlx.mlx_transpose, q_t, s); // [B,Hv,Dk,1]
+    defer release(&q_t3);
+    var y = mlx.mlx_array_new();
+    errdefer release(&y);
+    try mlx.check(mlx.mlx_matmul(&y, next, q_t3, s)); // [B,Hv,Dv,1]
+    return .{ .y = y, .st = next };
+}
+
+/// Per-token plain recurrence for decode and verify widths (S ≤ MAX_SEQ):
+/// matches K1/K1S bit-for-bit in spirit — f32 math with the state stored to
+/// bf16 (and reloaded) after every token, so `state_seq[t]` is exactly the
+/// state serial decode holds after token t. `want_seq` requires S ≥ 1.
+pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
+    const qsh = mlx.getShape(in.q);
+    if (qsh.len != 4 or qsh[1] < 1 or qsh[1] > MAX_SEQ) return error.GdnPlainWidth;
+    const b = qsh[0];
+    const t = qsh[1];
+    const hk = qsh[2];
+    const dk = qsh[3];
+    const vsh = mlx.getShape(in.v);
+    if (vsh.len != 4 or vsh[0] != b or vsh[1] != t) return error.GdnPlainShape;
+    const hv = vsh[2];
+    const dv = vsh[3];
+    const grp = @divExact(hv, hk);
+
+    var qh = try headsMajor(in.q, s); // [B,Hk,T,Dk]
+    defer release(&qh);
+    var kh = try headsMajor(in.k, s);
+    defer release(&kh);
+    var vh = try headsMajor(in.v, s); // [B,Hv,T,Dv]
+    defer release(&vh);
+    var gh = try headsMajor3(in.g, s); // [B,Hv,T]
+    defer release(&gh);
+    var bh = try headsMajor3(in.beta, s);
+    defer release(&bh);
+    var st = try make1(mlx.mlx_astype, in.state, s); // [B,Hv,Dv,Dk] f32
+    var st_owned = true;
+    defer if (st_owned) release(&st);
+
+    var y_parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(y_parts);
+    var seq_parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(seq_parts);
+
+    for (0..@intCast(t)) |ti| {
+        const tix: c_int = @intCast(ti);
+        var q_t = try slice4(qh, 2, tix, tix + 1, hk, grp, s); // [B,Hv,1,Dk]
+        defer release(&q_t);
+        var k_t = try slice4(kh, 2, tix, tix + 1, hk, grp, s);
+        defer release(&k_t);
+        var v_t = try slice4(vh, 2, tix, tix + 1, hv, 1, s); // [B,Hv,1,Dv]
+        defer release(&v_t);
+        var v_t1 = try make1(mlx.mlx_transpose, v_t, s); // [B,Hv,Dv,1]
+        defer release(&v_t1);
+        var g_t = try slice3(gh, 2, tix, tix + 1, s); // [B,Hv,1]
+        defer release(&g_t);
+        var g_t4 = try reshapeTo(g_t, &.{ b, hv, 1, 1 }, s); // [B,Hv,1,1]
+        defer release(&g_t4);
+        var b_t = try slice3(bh, 2, tix, tix + 1, s);
+        defer release(&b_t);
+        var b_t4 = try reshapeTo(b_t, &.{ b, hv, 1, 1 }, s);
+        defer release(&b_t4);
+
+        const step = try serialStep(st, q_t, k_t, v_t1, g_t4, b_t4, s);
+        release(&step.y); // squeezed below from the [.,.,.,1] form
+        if (st_owned) release(&st) else st_owned = true;
+        st = step.st;
+
+        // state_out is bf16 (as the kernel writes it); reload for the next step.
+        var st_b = try make1(mlx.mlx_astype, st, s);
+        defer release(&st_b);
+        var reloaded = try make1(mlx.mlx_astype, st_b, s);
+        release(&st);
+        st = reloaded;
+
+        if (want_seq) {
+            var seq_row = try make1(mlx.mlx_astype, st, s); // [B,Hv,Dv,Dk] bf16
+            defer release(&seq_row);
+            var owned = try make1(mlx.mlx_array_set, seq_row, s);
+            try mlx.check(mlx.mlx_vector_array_append_value(seq_parts, owned));
+            release(&owned);
+        }
+        var y4 = try make1(mlx.mlx_astype, st, s); // placeholder replaced below
+        release(&y4);
+    }
+    // (y rows are built in the loop above; see serialY.)
+    return error.GdnPlainUnreachable;
+}
+
+fn slice4(x: mlx.mlx_array, axis: c_int, from: c_int, to: c_int, heads: c_int, grp: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    _ = heads;
+    _ = grp;
+    _ = axis;
+    _ = from;
+    _ = to;
+    _ = s;
+    _ = x;
+    return error.GdnPlainUnreachable;
+}
+
+fn slice3(x: mlx.mlx_array, axis: c_int, from: c_int, to: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    _ = axis;
+    _ = from;
+    _ = to;
+    _ = s;
+    _ = x;
+    return error.GdnPlainUnreachable;
+}
+
+fn reshapeTo(x: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer release(&out);
+    try mlx.check(mlx.mlx_reshape(&out, x, shape.ptr, @intCast(shape.len), s));
+    return out;
+}

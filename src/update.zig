@@ -574,6 +574,9 @@ const Capture = struct { path: []const u8, stderr: bool = false };
 /// `replace` runs argv IN PLACE of this process (POSIX_SPAWN_SETEXEC); every fd but 0-2 is closed, so a listening
 /// socket never outlives its server.
 fn spawn(arena: Allocator, argv: []const []const u8, replace: bool, capture: ?Capture) !std.c.pid_t {
+    // The darwin posix_spawn shape (sigset literals, _np actions, CLOEXEC_DEFAULT)
+    // never compiles on Linux; the whole update/install flow is refused there first.
+    if (comptime @import("builtin").os.tag != .macos) return error.SpawnUnsupported;
     const argv_z = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |a, i| argv_z[i] = (try arena.dupeSentinel(u8, a, 0)).ptr;
     var attr: std.c.posix_spawnattr_t = undefined;
