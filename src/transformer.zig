@@ -31909,7 +31909,11 @@ pub const Transformer = struct {
             if (expertPickGpu(ids_contiguous, swap_logits, route.raw, starved, swap_tolerance, self.s)) |pick| {
                 spec_picked = pick.picked;
                 picked_slots = pick.slots;
-            } else |err| if (err != error.UnsupportedShape) return err;
+            // A stream that cannot run MSL (omarchy Vulkan) skips the lossy
+            // GPU pick exactly like an unsupported shape: the exact slot
+            // gather below serves the result and the host pick
+            // (swapMissedExperts → substituteMisses) runs at finish.
+            } else |err| if (err != error.UnsupportedShape and err != error.MetalKernelNeedsGpuStream) return err;
         };
         if (shared_eligible or swap_logits.ctx != null) {
             // The picked ids ride the ids' command buffer, so reading them never
