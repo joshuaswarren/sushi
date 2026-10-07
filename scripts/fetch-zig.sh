@@ -23,7 +23,7 @@ if [ -f "$STAMP" ] && [ -x "$DEST/zig" ]; then
 fi
 
 case "$(uname -m)" in
-  arm64) ARCH="aarch64" ;;
+  arm64|aarch64) ARCH="aarch64" ;;
   x86_64) ARCH="x86_64" ;;
   *) echo "[fetch-zig] ERROR: unsupported arch $(uname -m)" >&2; exit 1 ;;
 esac
@@ -48,7 +48,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "[fetch-zig] downloading $URL"
 curl -fSL --retry 3 -o "$TMP/zig.tar.xz" "$URL"
-GOT="$(shasum -a 256 "$TMP/zig.tar.xz" | cut -d' ' -f1)"
+GOT="$(shasum -a 256 "$TMP/zig.tar.xz" 2>/dev/null | cut -d' ' -f1)"
+[ -n "$GOT" ] || GOT="$(sha256sum "$TMP/zig.tar.xz" | cut -d' ' -f1)"
 if [ "$GOT" != "$SHA256" ]; then
   echo "[fetch-zig] ERROR: $ASSET sha256 $GOT, expected $SHA256" >&2
   exit 1

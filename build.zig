@@ -14,12 +14,14 @@ comptime {
 
 pub fn build(b: *std.Build) void {
     // Match libmlx's macOS 26.2 deployment target, required by its NAX kernels.
+    // Only meaningful for macOS builds; Linux targets build native.
     const target = b.standardTargetOptions(.{
-        .default_target = .{
+        .default_target = if (builtin.os.tag == .macos) .{
             .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
-        },
+        } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+    const is_macos = target.result.os.tag == .macos;
 
     // Setting any non-default target field disables Zig's native macOS SDK detection,
     // so we resolve the SDK path ourselves and surface its frameworks dir.
@@ -39,9 +41,9 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         verifyBrewDeps(b);
         verifyMlxStage(b);
+    } else {
+        verifyMlxStageLinux(b);
     }
-
-    if (builtin.os.tag != .macos) return;
 
     // Version: SemVer, build.zig.zon's `.version` unless the release workflow
     // passes the tag's version (release.sh checks the two agree).
@@ -54,6 +56,9 @@ pub fn build(b: *std.Build) void {
     // MLX reports its version at runtime; mlx-c and the guest manifest need build-time pins.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxPin(b, "mlxc=") orelse "unknown";
     const mlx_sha = readMlxPin(b, "mlx=") orelse "";
+
+    const webp_header: []const u8 = if (is_macos) "/opt/homebrew/include/webp/decode.h" else "/usr/include/webp/decode.h";
+    const webp_include: []const u8 = if (is_macos) "/opt/homebrew/include" else "/usr/include";
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -71,13 +76,18 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = webp_header }, .{ .cwd_relative = webp_include }, target, optimize) },
         },
     });
 
     // Jinja2 template engine (wangzhaode/jinja.cpp + nlohmann/json; see NOTICE).
-    // Precompiled with system clang++ for C++17's system libc++; rebuild instructions in CLAUDE.md.
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    // macOS uses the prebuilt libjinja.a (system clang++, C++17 libc++); Linux
+    // compiles the same 7 sources into the module (rebuild instructions in CLAUDE.md).
+    if (is_macos) {
+        mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    } else {
+        addJinjaSources(b, mod);
+    }
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
     // stb_image for JPEG/PNG decoding in the vision pipeline
@@ -85,24 +95,28 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("lib"));
 
-    addAneSources(b, mod);
+    addAneSources(b, mod, is_macos);
 
     // The staged MLX library path must precede Homebrew's.
-    addMlxLib(b, mod);
+    addMlxLib(b, mod, is_macos);
     _ = addExl3Module(b, mod, target, optimize);
-    // webp include/lib paths (homebrew)
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    // webp include/lib paths (homebrew on macOS, system on Linux)
+    mod.addIncludePath(.{ .cwd_relative = webp_include });
+    if (is_macos) {
+        mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
     mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
         mod.addFrameworkPath(.{ .cwd_relative = fw_path });
     }
-    mod.linkFramework("IOKit", .{});
-    mod.linkFramework("CoreFoundation", .{});
-    mod.linkFramework("Foundation", .{});
-    mod.linkFramework("Metal", .{});
-    mod.linkFramework("IOSurface", .{});
+    if (is_macos) {
+        mod.linkFramework("IOKit", .{});
+        mod.linkFramework("CoreFoundation", .{});
+        mod.linkFramework("Foundation", .{});
+        mod.linkFramework("Metal", .{});
+        mod.linkFramework("IOSurface", .{});
+    }
 
     const exe = b.addExecutable(.{
         .name = "sushi",
@@ -111,7 +125,7 @@ pub fn build(b: *std.Build) void {
 
     // Ensure Mach-O header has room for install_name_tool path changes — the
     // release tarball rewires @rpath/libmlxc.dylib to @executable_path.
-    exe.headerpad_max_install_names = true;
+    if (is_macos) exe.headerpad_max_install_names = true;
 
     b.installArtifact(exe);
 
@@ -132,31 +146,39 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = webp_header }, .{ .cwd_relative = webp_include }, target, optimize) },
         },
     });
 
-    test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    if (is_macos) {
+        test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    } else {
+        addJinjaSources(b, test_mod);
+    }
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     test_mod.addIncludePath(b.path("lib"));
-    addAneSources(b, test_mod);
+    addAneSources(b, test_mod, is_macos);
     test_mod.linkSystemLibrary("c++", .{});
-    addMlxLib(b, test_mod);
+    addMlxLib(b, test_mod, is_macos);
     const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
-    test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    test_mod.addIncludePath(.{ .cwd_relative = webp_include });
+    if (is_macos) {
+        test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
     test_mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
         test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
     }
-    test_mod.linkFramework("IOKit", .{});
-    test_mod.linkFramework("CoreFoundation", .{});
-    test_mod.linkFramework("Foundation", .{});
-    test_mod.linkFramework("Metal", .{});
-    test_mod.linkFramework("IOSurface", .{});
+    if (is_macos) {
+        test_mod.linkFramework("IOKit", .{});
+        test_mod.linkFramework("CoreFoundation", .{});
+        test_mod.linkFramework("Foundation", .{});
+        test_mod.linkFramework("Metal", .{});
+        test_mod.linkFramework("IOSurface", .{});
+    }
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
@@ -208,8 +230,15 @@ fn addCHeaderModule(
     return translate.createModule();
 }
 
-/// ARC bridge to AppleNeuralEngine, dlopen'd and checked for availability at runtime.
-fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
+/// ARC bridge to AppleNeuralEngine, dlopen'd and checked for availability at
+/// runtime. Linux links ane_stub.c instead: every symbol answers unavailable,
+/// so the opt-in --ane-prefill path never engages.
+fn addAneSources(b: *std.Build, module: *std.Build.Module, is_macos: bool) void {
+    module.addIncludePath(b.path("lib/ane"));
+    if (!is_macos) {
+        module.addCSourceFile(.{ .file = b.path("lib/ane/ane_stub.c"), .flags = &.{"-O2"} });
+        return;
+    }
     const objc_flags = &[_][]const u8{
         "-O3",
         "-fobjc-arc",
@@ -217,7 +246,27 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
     module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
-    module.addIncludePath(b.path("lib/ane"));
+}
+
+/// Linux: compile the jinja.cpp sources into the module instead of the
+/// macOS-prebuilt libjinja.a (CLAUDE.md: clang++ -std=c++17 -O2 -DNDEBUG -I .).
+fn addJinjaSources(b: *std.Build, module: *std.Build.Module) void {
+    const cpp_flags = &[_][]const u8{ "-O2", "-DNDEBUG" };
+    const sources = [_][]const u8{
+        "caps.cpp",
+        "jinja_string.cpp",
+        "jinja_wrapper.cpp",
+        "lexer.cpp",
+        "parser.cpp",
+        "runtime.cpp",
+        "value.cpp",
+    };
+    for (sources) |src| {
+        module.addCSourceFile(.{
+            .file = b.path(b.fmt("lib/jinja_cpp/{s}", .{src})),
+            .flags = cpp_flags,
+        });
+    }
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {
@@ -239,16 +288,22 @@ fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.Resol
     return exl3;
 }
 
-/// Link the NAX-enabled libraries staged by scripts/build-mlx.sh.
+/// Link the libraries staged by scripts/build-mlx.sh (macOS, NAX-enabled) or
+/// scripts/build-mlx-linux.sh (Linux, omarchy Vulkan backend).
 /// Release packaging rewrites their @rpath install names to @executable_path.
-fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+fn addMlxLib(b: *std.Build, module: *std.Build.Module, is_macos: bool) void {
     module.addIncludePath(b.path("lib/mlx/include"));
     module.addLibraryPath(b.path("lib/mlx/lib"));
     // Prevent Homebrew's mlx-c.pc from overriding the staged libraries.
     module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
     // Binary-relative paths cover zig-out/bin and .zig-cache/o/<hash> respectively.
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/mlx/lib" });
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/mlx/lib" });
+    if (is_macos) {
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/mlx/lib" });
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/mlx/lib" });
+    } else {
+        module.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
+        module.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
+    }
 }
 
 /// Fail before linking if the local MLX stage is missing.
@@ -263,6 +318,24 @@ fn verifyMlxStage(b: *std.Build) void {
         std.debug.print(
             "\n[sushi] lib/mlx is not staged (self-built mlx + mlx-c). Run:\n" ++
                 "  git submodule update --init lib/mlx-src lib/mlxc-src && ./scripts/build-mlx.sh\n\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+}
+
+/// Linux stage check: libmlx.so + libmlxc.so from the omarchy Vulkan build.
+fn verifyMlxStageLinux(b: *std.Build) void {
+    const stage_ok = blk: {
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.so", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlx.so", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!stage_ok) {
+        std.debug.print(
+            "\n[sushi] lib/mlx is not staged for Linux (omarchy mlx + mlx-c). Run:\n" ++
+                "  ./scripts/build-mlx-linux.sh   (see the script header for prerequisites)\n\n",
             .{},
         );
         std.process.exit(1);

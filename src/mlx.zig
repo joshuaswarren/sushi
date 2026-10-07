@@ -427,16 +427,40 @@ pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?
 /// before with no measurable overhead.
 var no_gpu_backend_cache: ?bool = null;
 
-/// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
-/// with MLX_BUILD_METAL=OFF). Callers use this to take CPU-only paths and skip
-/// GPU-only work (kernel-fusion JIT compilation). Always false on real hardware.
+/// True when MLX has no GPU backend at all. Detected by the default device's
+/// type, not by Metal availability: the omarchy Vulkan backend also serves the
+/// GPU device on Linux, where mlx_metal_is_available() is always false.
+/// Callers use this to take CPU-only paths. Always false on real GPU hardware.
 pub fn noGpuBackend() bool {
     if (no_gpu_backend_cache == null) {
-        var avail: bool = false;
-        _ = mlx_metal_is_available(&avail);
-        no_gpu_backend_cache = !avail;
+        var dev: mlx_device = .{ .ctx = null };
+        var dt: mlx_device_type = .cpu;
+        if (mlx_get_default_device(&dev) != 0) {
+            no_gpu_backend_cache = true;
+        } else {
+            defer _ = mlx_device_free(dev);
+            if (mlx_device_get_type(&dt, dev) != 0) {
+                no_gpu_backend_cache = true;
+            } else {
+                no_gpu_backend_cache = dt != .gpu;
+            }
+        }
     }
     return no_gpu_backend_cache.?;
+}
+
+var metal_backend_cache: ?bool = null;
+
+/// True only when MLX's Metal backend (and its MSL kernel JIT) is usable.
+/// Custom metal kernels must gate on this, never on streamIsGpu alone: the
+/// omarchy Vulkan backend also serves .gpu streams but cannot run MSL.
+pub fn streamIsMetal(s: mlx_stream) bool {
+    if (metal_backend_cache == null) {
+        var avail = false;
+        _ = mlx_metal_is_available(&avail);
+        metal_backend_cache = avail;
+    }
+    return streamIsGpu(s) and metal_backend_cache.?;
 }
 
 pub fn gpuStream() mlx_stream {
@@ -709,7 +733,7 @@ pub fn applyWiredPolicy() WiredPolicyResult {
         .max => {
             const max_rec = maxRecommendedWorkingSet();
             if (max_rec == 0) return .{ .mode = mode, .target = null };
-            _ = mlx_set_wired_limit(&prev, max_rec);
+            if (mlx_set_wired_limit(&prev, max_rec) != 0) return .{ .mode = mode, .target = null };
             return .{ .mode = mode, .target = max_rec };
         },
         .fit => {
@@ -729,7 +753,7 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             // Shrink-then-grow forces ResidencySet::resize to re-walk, pulling
             // buffers allocated since the last apply out of the unwired set.
             _ = mlx_set_wired_limit(&prev, 0);
-            _ = mlx_set_wired_limit(&prev, target);
+            if (mlx_set_wired_limit(&prev, target) != 0) return .{ .mode = mode, .target = null };
             return .{ .mode = mode, .target = target };
         },
     }
