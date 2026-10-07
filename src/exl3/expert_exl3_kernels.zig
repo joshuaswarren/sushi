@@ -3120,7 +3120,7 @@ fn plainMoeFused(
         for (p[0..sc_count], 0..) |v, i| score_f[i] = @bitCast(@as(u32, v) << 16);
     } else return error.F32Unreadable;
 
-    const tstride_gu: usize = @intCast(gt[1] * gt[2] * rate.halfwords());
+    const tstride_gu: usize = @as(usize, @intCast(gt[1])) * @as(usize, @intCast(gt[2])) * rate.halfwords();
     const tstride_d: usize = tstride_gu;
 
     const gate_w = try alloc.alloc(u16, @intCast(hidden * inter));
