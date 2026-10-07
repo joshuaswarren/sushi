@@ -117,11 +117,10 @@ fn auditHeaders(a: std.mem.Allocator, io: std.Io, directory: []const u8, cfg: *c
     for (names.items) |shard| {
         const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ directory, shard }, 0);
         defer a.free(path);
-        const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.MissingIndexedGlmWeight;
-        defer _ = std.c.close(fd);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0 or st.size < 8) return error.InvalidGlmTeacherHeader;
+        const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY }, 0);
+        defer std.posix.close(fd);
+        var st = try std.posix.fstat(fd);
+        if (st.size < 8) return error.InvalidGlmTeacherHeader;
         const mt = st.mtime();
         const stamp = try std.fmt.allocPrint(a, "{s}:{d}:{d}:{d}:{d}\n", .{ shard, st.ino, st.size, mt.sec, mt.nsec });
         defer a.free(stamp);

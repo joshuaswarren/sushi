@@ -171,6 +171,8 @@ fn upgradeCommand() []const u8 {
 
 /// Why the install at `dir` (the real directory of the running binary) cannot replace itself, or null.
 pub fn installRefusal(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
+    if (@import("builtin").os.tag != .macos)
+        return "self-update is macOS-only in this build; install the new release tarball by hand";
     const cwd = std.Io.Dir.cwd();
     if (isHomebrewKeg(dir)) return brew_notice;
     if (isSourceBuild(io, dir)) return "built from source: git pull and rebuild";
