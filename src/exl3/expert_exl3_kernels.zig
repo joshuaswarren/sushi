@@ -3067,10 +3067,12 @@ fn plainMoeFused(
     const ssh = mlx.getShape(slots_u);
     const rows: c_int = if (xsh.len == 1) 1 else xsh[0];
     const nslots: c_int = ssh[0];
-    if (nslots <= 0 or nslots > 4096) return error.Exl3TopkUnsupported;
+    if (nslots <= 0 or nslots > 65536) return error.Exl3TopkUnsupported;
     if (rows != 1 and nslots != rows * topk) return error.BadExl3Shape;
     const x_size: usize = @intCast(if (xsh.len == 1) xsh[0] else xsh[0] * xsh[1]);
-    if (x_size > 16 * 4096) return error.BadExl3Shape;
+    // 32M elements = 128 MB f32 host copy + matching acc buffer: whole-prefill
+    // calls (one decoded[] dequant pass, one eval per input) fit easily.
+    if (x_size > 32 * 1024 * 1024) return error.BadExl3Shape;
 
     try mlx.check(mlx.mlx_array_eval(slots_u));
     const slots_ptr = mlx.mlx_array_data_uint32(slots_u) orelse return error.UnreadableExl3Output;
@@ -3149,6 +3151,10 @@ fn plainMoeFused(
     @memset(acc_f, 0);
     var gate_y = try alloc.alloc(f32, @intCast(inter));
     defer alloc.free(gate_y);
+    const ag_buf = try alloc.alloc(f32, @intCast(inter));
+    defer alloc.free(ag_buf);
+    const au_buf = try alloc.alloc(f32, @intCast(inter));
+    defer alloc.free(au_buf);
 
     var decoded: [512]u8 = @splat(0);
     const hidden_u: usize = @intCast(hidden);
@@ -3197,13 +3203,23 @@ fn plainMoeFused(
         }
         const r = slot / @as(usize, @intCast(topk));
         const x_row = xf[r * hidden_u ..][0..hidden_u];
-        for (0..inter_u) |o| {
-            var ag: f32 = 0;
-            var au: f32 = 0;
-            for (0..hidden_u) |k| {
-                ag += x_row[k] * exl3.f16BitsToF32(gate_w[k * inter_u + o]);
-                au += x_row[k] * exl3.f16BitsToF32(up_w[k * inter_u + o]);
+        // Row-major weight walk: the inner loop streams contiguous memory and
+        // auto-vectorizes; the previous per-output strided walk did not.
+        // Same sums, different accumulation order.
+        @memset(ag_buf[0..inter_u], 0);
+        @memset(au_buf[0..inter_u], 0);
+        for (0..hidden_u) |k| {
+            const xv = x_row[k];
+            const gw = gate_w[k * inter_u ..][0..inter_u];
+            const uw = up_w[k * inter_u ..][0..inter_u];
+            for (0..inter_u) |o| {
+                ag_buf[o] += xv * exl3.f16BitsToF32(gw[o]);
+                au_buf[o] += xv * exl3.f16BitsToF32(uw[o]);
             }
+        }
+        for (0..inter_u) |o| {
+            var ag = ag_buf[o];
+            var au = au_buf[o];
             if (limit > 0) {
                 const lim: f32 = @floatFromInt(limit);
                 ag = @min(ag, lim);
@@ -3214,10 +3230,11 @@ fn plainMoeFused(
             const silu = ag * sig;
             gate_y[o] = silu * au;
         }
-        for (0..hidden_u) |o| {
-            var ad: f32 = 0;
-            for (0..inter_u) |k| ad += gate_y[k] * exl3.f16BitsToF32(down_w[k * hidden_u + o]);
-            acc_f[r * hidden_u + o] += score_f[slot] * ad;
+        const acc_row = acc_f[r * hidden_u ..][0..hidden_u];
+        for (0..inter_u) |k| {
+            const gy = gate_y[k];
+            const dw = down_w[k * hidden_u ..][0..hidden_u];
+            for (0..hidden_u) |o| acc_row[o] += gy * exl3.f16BitsToF32(dw[o]);
         }
     }
 
@@ -3438,12 +3455,16 @@ pub fn moeSwigluClamped(
         const alloc = arena.allocator();
         const sh_n = mlx.getShape(x);
         const inter_n: c_int = mlx.getShape(gate_t)[2] * 16;
-        // plainMoeFused is a host loop bounded to 16*4096 elements of x;
-        // serve wide prefills in row chunks within that cap (decode stays
-        // one chunk). Chunks are row-independent, so results are identical.
+        // plainMoeFused is a host loop bounded to 32M elements of x and 64K
+        // slots; serve wide prefills in row chunks within those caps (decode
+        // stays one chunk, whole prefills up to the bound stay one chunk).
+        // Chunks are row-independent, so results are identical.
         const rows_n: c_int = if (sh_n.len == 1) 1 else sh_n[0];
         const dim_n: c_int = if (sh_n.len == 1) sh_n[0] else sh_n[1];
-        const chunk_rows: c_int = @max(1, @divTrunc(16 * 4096, @max(dim_n, 1)));
+        const chunk_rows: c_int = @min(
+            @max(1, @divTrunc(32 * 1024 * 1024, @max(dim_n, 1))),
+            @max(1, @divTrunc(65536, @max(topk, 1))),
+        );
         if (rows_n <= chunk_rows)
             return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
         const parts = mlx.mlx_vector_array_new();
