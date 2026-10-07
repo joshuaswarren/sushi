@@ -218,6 +218,7 @@ const RENAME_SWAP: c_uint = 0x2;
 
 /// Exchanges the directories at `a` and `b` in one atomic step (APFS, HFS+); elsewhere `swapByRenames`.
 pub fn swapPaths(io: std.Io, a: []const u8, b: []const u8) !void {
+    if (comptime @import("builtin").os.tag != .macos) return swapByRenames(io, a, b); // renamex_np is darwin-only
     var za: [std.fs.max_path_bytes:0]u8 = undefined;
     var zb: [std.fs.max_path_bytes:0]u8 = undefined;
     const pa = try std.mem.printSentinel(&za, "{s}", .{a}, 0);

@@ -204,6 +204,23 @@ const DarwinStatfs = extern struct {
 extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
 extern fn sushi_volume_free_for_use(path: [*:0]const u8) u64;
 
+/// statvfs for the Linux arm (glibc layout through f_namemax).
+const LinuxStatvfs = extern struct {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: u64,
+    f_flag: c_int,
+    f_namemax: u64,
+    __spare: [6]c_int,
+};
+extern "c" fn statvfs(path: [*:0]const u8, buf: *LinuxStatvfs) c_int;
+
 pub const VolumeSpace = struct { free: u64, total: u64 };
 
 /// Free and total bytes of the volume holding `path`, or null when the query fails or returns
@@ -213,6 +230,13 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
+    if (comptime @import("builtin").os.tag != .macos) {
+        var v: LinuxStatvfs = std.mem.zeroes(LinuxStatvfs);
+        if (statvfs(buf[0..path.len :0].ptr, &v) != 0) return null;
+        const frsize: u64 = if (v.f_frsize != 0) v.f_frsize else v.f_bsize;
+        if (frsize < 512 or frsize > (1 << 20) or v.f_blocks == 0 or v.f_bavail > v.f_blocks) return null;
+        return .{ .free = frsize *| v.f_bavail, .total = frsize *| v.f_blocks };
+    }
     var st: DarwinStatfs = undefined;
     if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
     const bsize: u64 = st.f_bsize;
