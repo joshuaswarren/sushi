@@ -12,7 +12,7 @@ pub fn resetCallCount() void {
 }
 
 pub fn apply(s: mlx.mlx_stream, gate: Arr, up: Arr, limit: f32) !?Arr {
-    if (!mlx.streamIsGpu(s) or gate.ctx == null or up.ctx == null or limit != 10 or
+    if (!mlx.streamIsMetal(s) or gate.ctx == null or up.ctx == null or limit != 10 or
         mlx.mlx_array_dtype(gate) != .bfloat16 or mlx.mlx_array_dtype(up) != .bfloat16 or
         !std.mem.eql(c_int, mlx.getShape(gate), mlx.getShape(up))) return null;
     if (mlx.getShape(gate).len == 0) return null;

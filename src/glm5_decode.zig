@@ -169,7 +169,7 @@ fn configuration(width: c_int, dims: [3]c_int, rank: usize) !Config {
 }
 
 pub fn qkv(s: mlx.mlx_stream, x: Arr, banks: [3]Bank) !?[3]Arr {
-    if (!mlx.streamIsGpu(s) or x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    if (!mlx.streamIsMetal(s) or x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const sh = mlx.getShape(x);
     if (sh.len < 2 or sh.len > 3) return null;
     const width = sh[sh.len - 1];
@@ -227,7 +227,7 @@ pub fn qkv(s: mlx.mlx_stream, x: Arr, banks: [3]Bank) !?[3]Arr {
 test "GLM copy-free QKV is bit exact to affine8 group128 MLX" {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(416138);
     const rnd = random.random();
     for ([_]struct { k: usize, n: usize }{ .{ .k = 256, .n = 24 }, .{ .k = 4096, .n = 8192 } }) |shape| {
@@ -325,7 +325,7 @@ test "GLM copy-free QKV declines dense and strided banks" {
 test "GLM copy-free QKV is bit exact to affine6 group128 MLX" {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var random = std.Random.DefaultPrng.init(416138);
     const rnd = random.random();
     for ([_]struct { k: usize, n: usize }{ .{ .k = 256, .n = 24 }, .{ .k = 4096, .n = 8192 } }) |shape| {

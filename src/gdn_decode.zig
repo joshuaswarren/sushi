@@ -322,7 +322,7 @@ fn inputsFit(g: Geometry, t_len: c_int, in: Inputs) bool {
 /// with per-step state capture). Null outside the kernels' geometry and outside
 /// bf16, the one width the chain's prework, recurrence and norm-gate all serve.
 pub fn step(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recur {
-    if (!mlx.streamIsGpu(s) or !inputsFit(g, t_len, in)) return null;
+    if (!mlx.streamIsMetal(s) or !inputsFit(g, t_len, in)) return null;
 
     const seq = t_len > 1;
     const kernel = if (seq)
@@ -408,7 +408,7 @@ fn buildFoldConfig(key: FoldKey, t_len: c_int) !mlx.mlx_fast_metal_kernel_config
 /// Verify recurrence, norm-gate and rollback convolution history in one dispatch.
 /// The recurrence retains the stored bf16 state between tokens, as serial decode does.
 pub fn stepFold(g: Geometry, t_len: c_int, in: Inputs, z: mlx.mlx_array, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, s: mlx.mlx_stream) !?Fold {
-    if (!mlx.streamIsGpu(s) or t_len < 2 or !inputsFit(g, t_len, in)) return null;
+    if (!mlx.streamIsMetal(s) or t_len < 2 or !inputsFit(g, t_len, in)) return null;
     if (mlx.mlx_array_dtype(z) != .bfloat16 or mlx.mlx_array_dtype(norm_w) != .bfloat16 or mlx.mlx_array_dtype(eps) != .float32) return null;
     if (!shapeIs(z, &.{ 1, t_len, g.hv * g.dv }) or !shapeIs(norm_w, &.{g.dv}) or mlx.mlx_array_size(eps) != 1) return null;
     if (fold_kernel == null) {

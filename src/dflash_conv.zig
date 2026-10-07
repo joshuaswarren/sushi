@@ -26,7 +26,7 @@ const Config = struct { key: Key, value: mlx.mlx_fast_metal_kernel_config };
 var configs: [16]?Config = @splat(null);
 
 pub fn apply(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size: u32) !?Arr {
-    if (!mlx.streamIsGpu(s) or group_size == 0) return null;
+    if (!mlx.streamIsMetal(s) or group_size == 0) return null;
     for ([_]Arr{ hidden, dynamic, base }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return null;
     const shape = mlx.getShape(hidden);
     if (shape.len != 3 or shape[0] != 1 or shape[1] < 1 or shape[1] > 8 or shape[2] < 1 or shape[2] > 4096 or group_size > @as(u32, @intCast(shape[2]))) return null;
@@ -76,7 +76,7 @@ pub fn apply(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size
 }
 
 test "DFlash fused convolution preserves BF16 boundaries and strided tap sets" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !mlx.streamIsMetal(mlx.gpuStream())) return error.SkipZigTest;
     const Ops = @import("glm5_model.zig").Ops;
     const fixture = @import("dflash.zig").TinyFix;
     for ([_]c_int{ 128, 4096 }) |width| for ([_]c_int{ 1, 2, 3, 8 }) |len| {

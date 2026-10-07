@@ -1434,6 +1434,7 @@ pub fn verifyQmm(
     group_size: u32,
 ) !?mlx.mlx_array {
     if (!verifyQmmEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     // The plain-SIMD split-K/msg kernels carry byte-addressed 5/6/8-bit unpack,
     // but mixed-width adoption remains restricted to measured width/shape
     // combinations. The M5 NAX tile additionally handles eligible mixed-bit
@@ -1680,6 +1681,7 @@ extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*us
 /// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
 /// Python's platform.mac_ver()[0]).
 pub fn macosProductVersion(buf: []u8) ?[]const u8 {
+    if (@import("builtin").os.tag != .macos) return null;
     var len: usize = buf.len;
     if (sysctlbyname("kern.osproductversion", buf.ptr, &len, null, 0) != 0) return null;
     var n = @min(len, buf.len);
@@ -2633,7 +2635,7 @@ const ATTN_PD_NAX_PROBE_FLOOR: f32 = 4.9e-4;
 pub fn attnPdNaxRunProbe() bool {
     if (mlx.noGpuBackend()) return false;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return false;
+    if (!mlx.streamIsMetal(s)) return false;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     for ([_]bool{ false, true }) |banded| {
@@ -3588,6 +3590,7 @@ fn qsaGatherProbeDispatch(
     nax: bool,
     kv8: ?*const [2]kv_quant.QuantizedKV,
 ) ?mlx.mlx_array {
+    if (!mlx.streamIsMetal(s)) return null;
     const kernel = (if (kv8 != null) getQsaGatherPackedKernel(nax) else if (nax) getQsaNaxKernel() else getAttnQsa256Kernel()) catch return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -3637,7 +3640,7 @@ fn qsaGatherProbeDispatch(
 fn qsaNaxRunProbe() bool {
     if (mlx.noGpuBackend()) return false;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return false;
+    if (!mlx.streamIsMetal(s)) return false;
     const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 24, 16, 256 }, 0x9A7E016) orelse return false;
     defer _ = mlx.mlx_array_free(q);
     const k = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 16, 256 }, 0x51A2002) orelse return false;
@@ -3826,7 +3829,7 @@ fn gatherQsa256Impl(
     ratio: c_int,
 ) !?mlx.mlx_array {
     if (!qsaGatherEnabled()) return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const is_packed = view.has_quant_triple;
     const k = if (is_packed) view.k_triple_q else view.k;
     const v = if (is_packed) view.v_triple_q else view.v;
@@ -4393,7 +4396,7 @@ pub fn qsaSelectTopBlocks(
     kb: c_int,
 ) !?mlx.mlx_array {
     if (!qsaSelectKernelEnabled()) return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (scores.ctx == null or bounds.ctx == null) return null;
     if (mlx.mlx_array_dtype(scores) != .float32 or mlx.mlx_array_dtype(bounds) != .int32) return null;
     if (mlx.mlx_array_ndim(scores) != 3 or mlx.mlx_array_ndim(bounds) != 1) return null;
@@ -4556,7 +4559,7 @@ fn qsaSelectTopBlocksSplit(
     rows: c_int,
     nb: c_int,
 ) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const g = QSA_SELECT_SPLIT_G;
     const loc_count = std.math.mul(c_int, kb, g) catch return null;
     const local_kernel = getQsaSelectSplitLocalKernel() catch return null;
@@ -5061,7 +5064,7 @@ fn qsaScoreFusedRunProbe() bool {
         return false;
     }
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) {
+    if (!mlx.streamIsMetal(s)) {
         log.info("[qsa-score] disabled: not gpu stream\n", .{});
         return false;
     }
@@ -5077,7 +5080,7 @@ fn qsaScoreFusedRunProbe() bool {
 pub fn qsaScoreFused(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !?mlx.mlx_array {
     qsaScoreFusedArm();
     if (!qsaScoreFusedEligibleFrom(q, pooled)) return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!qsaPooledRowContiguous(pooled)) return null;
     return try qsaScoreFusedDispatch(s, q, pooled);
 }
@@ -5831,7 +5834,7 @@ pub fn qsaSparseAttn(
     attn_scale: f32,
 ) !?mlx.mlx_array {
     if (!qsaAttnKernelEnabled()) return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
@@ -5919,7 +5922,7 @@ var qkv_splitk_engaged: bool = false;
 /// matrix units, so it serves every Apple GPU. t_q 1..8, no mask or end-aligned causal; any
 /// (DK, DV) up to 256 in multiples of the quant group. Null = declined.
 pub fn qkvAttnSplitKKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!view.has_quant_triple or (view.bits != 4 and view.bits != 8)) return null;
     const gs: c_int = @intCast(view.group_size);
     if (gs == 0 or @rem(gs, 8) != 0) return null;
@@ -7338,6 +7341,7 @@ fn fusedSdpaPrefillImpl(
     sinks: mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
@@ -7651,7 +7655,7 @@ pub fn splitCausalSdpa(
     if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
     if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1) return null;
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
-    if (ks[1] > 0 and qs[1] == 12 * ks[1] and qs[2] >= 2 and qs[2] <= 9 and mlx.streamIsGpu(s)) {
+    if (ks[1] > 0 and qs[1] == 12 * ks[1] and qs[2] >= 2 and qs[2] <= 9 and mlx.streamIsMetal(s)) {
         return try sdpaTickIdenticalGroups(s, q, k, v, scale);
     }
     if (qs[2] < 6 or qs[2] > 9) return null;
@@ -15261,6 +15265,7 @@ pub fn qkvAttnDecodeKernel(
     mask_arr: mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (!qkvDecKernelEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!view.has_quant_triple) return null;
     if (view.bits != 4 and view.bits != 8) return null;
     if (view.group_size == 0) return null;
@@ -15531,6 +15536,7 @@ pub fn qkvAttnVerifyKernel(
     mask_mode: []const u8,
 ) !?mlx.mlx_array {
     if (!qkvVerifyKernelEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!view.has_quant_triple) return null;
     if (view.bits != 4 and view.bits != 8) return null;
     if (view.group_size == 0) return null;
@@ -15985,6 +15991,7 @@ fn qkvMppProbe(kernel: mlx.mlx_fast_metal_kernel, key: QkvMppKey) bool {
 
 fn qkvMppRunProbe(kernel: mlx.mlx_fast_metal_kernel, key: QkvMppKey) bool {
     const s = mlx.gpuStream();
+    if (!mlx.streamIsMetal(s)) return false;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     const cfg = qkvMppConfig(key, 1, 1) catch return false;
@@ -16457,6 +16464,7 @@ fn mimoSlidingRowsAttn(
     decode_mask: mlx.mlx_array,
 ) !?mlx.mlx_array {
     // MLX's one-pass vector kernel serves (qk 192, v 128) only below 1024 keys.
+    if (!mlx.streamIsMetal(s)) return null;
     if (offset + 1 <= window or window >= 1024 or rows < 2 or rows > MIMO_VERIFY_ROWS_MAX) return null;
     if (sinks.ctx == null or decode_mask.ctx == null or view.k.ctx == null or view.v.ctx == null) return null;
     const qs = mlx.getShape(q);
@@ -18743,6 +18751,7 @@ pub const Transformer = struct {
     /// (a 32-row slice of the same qmv, so each value is the full readout's), every other id -inf.
     /// Serial ticks and verify rows take it alike; null keeps the full head.
     fn lmHeadShortlistFor(self: *const Transformer, x: mlx.mlx_array) !?mlx.mlx_array {
+        if (!mlx.streamIsMetal(self.s)) return null;
         const coarse = self.lm_head_coarse orelse return null;
         if (!self.config.isMimo() or !lmHeadShortlistOn()) return null;
         const xsh = mlx.getShape(x);
@@ -18786,6 +18795,7 @@ pub const Transformer = struct {
     /// on any decline (caller keeps the dense path); never errors a request
     /// out on a build failure.
     fn lmHeadPruneFor(self: *const Transformer, x: mlx.mlx_array) !?mlx.mlx_array {
+        if (!mlx.streamIsMetal(self.s)) return null;
         if (!lmHeadPruneEnabled()) return null;
         // Single-row decode only: [1, 1, hidden]. Verify/prefill widths keep
         // the dense weight (the coarse pass is a one-row GEMV).
@@ -23814,7 +23824,7 @@ pub const Transformer = struct {
         // scores[b, s, blk] = sum_h relu(q_h . k_blk) in f32 like the reference; the 1/sqrt(hd)
         // scale is dropped because it is monotone for the top-k. Borrowed from the entry.
         const fused = qsaScoreFusedEligibleFrom(q_rope, entry.qsa_pooled) and
-            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(self.s);
+            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsMetal(self.s);
         const k32 = try self.qsaScoreOperand(entry, batch, nb, idx_hd, fused);
 
         // A packed cache gathers at every width (split-K, packed, or from its rebuild), never the mask arm.
@@ -23984,7 +23994,7 @@ pub const Transformer = struct {
     /// INT_MAX past the row's count. Under `all_vis` the visibility sheet and both `where`s are
     /// identities and are skipped; the fused arm reads the same claim through `qsaVisibleBoundsHost`.
     fn qsaChunkSelect(self: *Transformer, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
-        if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsGpu(self.s)) {
+        if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsMetal(self.s)) {
             // The whole composed tail in one dispatch; bounds are host arithmetic.
             const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
             defer self.allocator.free(bounds_host);
@@ -25130,7 +25140,7 @@ pub const Transformer = struct {
     pub var qwen4_trace: ?*Qwen4Trace = null;
 
     fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
-        if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
+        if (self.qwen4 == null or !mlx.streamIsMetal(self.s) or !moeRouterFusedEnabled() or
             token_rows.len < 2 or token_rows.len > 8 or token_rows.len != ctxs.len or
             self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32)
         {
@@ -30219,6 +30229,8 @@ pub const Transformer = struct {
         const gdn_in_itemsize = mlx.mlx_array_itemsize(q_scaled);
         const gdn_state_dtype = mlx.mlx_array_dtype(ssm.ssm_state);
 
+        if (!mlx.streamIsMetal(self.s)) return error.MetalKernelNeedsGpuStream;
+
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
@@ -31606,7 +31618,7 @@ pub const Transformer = struct {
     }
 
     fn moeVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, mw: *const MoeMlpWeights) ![]mlx.mlx_array {
-        if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
+        if (self.qwen4 == null or !mlx.streamIsMetal(self.s) or !moeRouterFusedEnabled() or
             inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
             mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared or
             self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
@@ -36159,6 +36171,7 @@ fn moeRouterTopKGate(
     topk_group: c_int,
     gate: ?RouterGate,
 ) !?Transformer.MoeRouting {
+    if (!mlx.streamIsMetal(s)) return null;
     if (!moeRouterFusedEnabled()) return null;
     const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
     const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
@@ -36921,6 +36934,7 @@ var expert_pick_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const ExpertPick = struct { slots: mlx.mlx_array, picked: mlx.mlx_array };
 
 fn expertPickGpu(ids: mlx.mlx_array, logits: mlx.mlx_array, map: mlx.mlx_array, starved: mlx.mlx_array, tolerance: f32, s: mlx.mlx_stream) !ExpertPick {
+    if (!mlx.streamIsMetal(s)) return error.MetalKernelNeedsGpuStream;
     const k: c_int = @intCast(mlx.mlx_array_size(ids));
     const experts: c_int = @intCast(mlx.mlx_array_size(map));
     if (k < 1 or k > 32 or experts < 1 or experts > 1024 or mlx.mlx_array_size(logits) != @as(usize, @intCast(experts))) return error.UnsupportedShape;
@@ -37414,6 +37428,7 @@ pub fn fusedQkNormRope(
     rd: c_int,
 ) !?[2]mlx.mlx_array {
     if (!qkNormRopeFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16) return null;
     // rd=32 is the qwen3.5/3.6 partial-rotary geometry (0.25 x 128); the
@@ -37631,6 +37646,7 @@ pub fn mimoDecodeQkvPrep(
     rd: c_int,
     rows: c_int,
 ) !?MimoQkvPrep {
+    if (!mlx.streamIsMetal(s)) return null;
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16 or mlx.mlx_array_dtype(v_flat) != .bfloat16) return null;
     if (rd != 64 or rows < 1 or rows > MIMO_VERIFY_ROWS_MAX) return null;
@@ -38080,6 +38096,7 @@ pub const GdnPreworkArgs = struct {
 /// caller keeps the composed chain. The caller owns all six outputs (and
 /// installs `conv_state` into the SSM cache entry).
 pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
+    if (!mlx.streamIsMetal(s)) return null;
     if (!gdnPreworkEnabled()) return null;
     if (!gdnPrefillFusedFor(in.seq, in.batch) and (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS)) return null;
     if (in.seq < 3 and !gdnDecodeFusedEnabled()) return null;
@@ -38226,6 +38243,7 @@ pub fn gdnNormGateFused(
     batch: c_int,
     seq: c_int,
 ) !?mlx.mlx_array {
+    if (!mlx.streamIsMetal(s)) return null;
     if (dv != 128) return null;
     const prefill = gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
@@ -38369,7 +38387,7 @@ pub fn qsaPoolNormRopeFused(
     sinv: mlx.mlx_array,
     rope_dims: c_int,
 ) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const ksh = mlx.getShape(kb4);
     const wsh = mlx.getShape(norm_w);
     const csh = mlx.getShape(cosv);
@@ -38482,6 +38500,7 @@ pub fn fusedQkNormRope256(
     rd: c_int,
 ) !?[2]mlx.mlx_array {
     if (!qkNormRopeFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (seq < 1 or seq > 32) return null;
     const dt = mlx.mlx_array_dtype(q_in);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_in) != .bfloat16) return null;
@@ -39485,6 +39504,7 @@ fn addRmsNormKernel(
     eps_arr: mlx.mlx_array,
     f32_copy: bool,
 ) !?AddNormResult {
+    if (!mlx.streamIsMetal(s)) return null;
     // A Transformer built by a construction site that predates `rms_eps_arr`
     // would hand us a null handle; decline rather than pass it to mlx.
     if (w.ctx == null or eps_arr.ctx == null) return null;
@@ -39656,6 +39676,7 @@ fn fusedAttnGate(
     hd: c_int,
 ) !?mlx.mlx_array {
     if (!attnGateFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const dt = mlx.mlx_array_dtype(attn_flat);
     if (dt != mlx.mlx_array_dtype(g_logits)) return null;
     if (dt != .bfloat16 and dt != .float16 and dt != .float32) return null;
@@ -39823,6 +39844,7 @@ var swiglu_cfg_key: SwigluCfgKey = std.mem.zeroes(SwigluCfgKey);
 /// second kernel.
 pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?mlx.mlx_array {
     if (!swigluFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     const dt = mlx.mlx_array_dtype(gate);
     if (dt != mlx.mlx_array_dtype(up)) return null;
     // FLOAT32 IS DECLINED ON PURPOSE. MLX ships its own kernels in a metallib
@@ -40528,7 +40550,7 @@ fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_in
 }
 
 fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
-    if (!hcFusedEnabled() or !mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
+    if (!hcFusedEnabled() or !mlx.streamIsMetal(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
     if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
     const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
     const shapes = .{ &[_]c_int{ 4, 2560 }, &[_]c_int{ 320, 2560 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 10240, 80 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 4 } };
@@ -40581,7 +40603,7 @@ fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width:
 }
 
 fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?[]const HcPending) !?[]HcFusedOut {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 1) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 1) return null;
     const total = @as(c_int, @intCast(inputs.len)) * width;
     if (total > HC_FUSED_MAX_ROWS or w.inject_flat.ctx == null) return null;
     for (inputs) |input| {
@@ -40671,7 +40693,7 @@ pub fn hcReadFused(
     pend: ?HcPending,
 ) !?HcFusedOut {
     if (!hcFusedEnabled()) return null;
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (bits != 2 and bits != 4 and bits != 8) return null;
     const rows = batch * seq;
     if (rows < 1 or rows > HC_FUSED_MAX_ROWS) return null;
@@ -40887,6 +40909,7 @@ pub fn gatherQmvGateUp(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (envFlagCached(&gqmv_disabled_env, "SUSHI_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
@@ -41100,6 +41123,7 @@ pub fn gatherQmvGateUpRows(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!moeRowsFusedEnabled()) return null;
     if (envFlagCached(&gqmv_disabled_env, "SUSHI_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
@@ -41257,6 +41281,7 @@ pub fn gatherQmv(
     x_per_expert: bool,
 ) !?mlx.mlx_array {
     if (envFlagCached(&gqmv_disabled_env, "SUSHI_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     // Two dequant arithmetics, one kernel shape. Any other mode (mxfp4/mxfp8,
     // whose scales are e8m0 over different group sizes) falls back — running a
     // bank through the wrong dequant is silently wrong, not a crash.
@@ -41486,6 +41511,7 @@ pub fn gatherQmvDownReduce(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (envFlagCached(&gqmv_disabled_env, "SUSHI_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
@@ -41694,6 +41720,7 @@ pub fn gatherQmvDownReduceRows(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (!moeRowsFusedEnabled()) return null;
     if (envFlagCached(&gqmv_disabled_env, "SUSHI_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
@@ -41910,7 +41937,7 @@ pub fn msvQmvRows(
     bits: u32,
     group_size: u32,
 ) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsMetal(s)) return null;
     if (bits != 3 and bits != 4 and bits != 8) return null;
     if (group_size != 64) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
@@ -42676,7 +42703,7 @@ const ExpertReuseKey = struct { rows: c_int, n: c_int, k: c_int };
 var verify_expert_reuse_cfgs = QsaCfgCache(ExpertReuseKey, 1){};
 
 fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware()) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware()) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null or ids.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(ids) != .uint32) return null;
     const xs = mlx.getShape(x);
@@ -42753,7 +42780,7 @@ var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var verify_expert_reduce_cfgs = QsaCfgCache(c_int, 1){};
 
 fn verifyExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware()) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware()) return null;
     if (down.ctx == null or inverse.ctx == null or scores.ctx == null) return null;
     if (mlx.mlx_array_dtype(down) != .bfloat16 or mlx.mlx_array_dtype(scores) != .bfloat16 or mlx.mlx_array_dtype(inverse) != .uint32) return null;
     const ds = mlx.getShape(down);
@@ -42864,7 +42891,7 @@ var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mtp_coarse_pairs_cfgs = QsaCfgCache(c_int, 1){};
 
 pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32) return null;
     const xs = mlx.getShape(x);
@@ -42949,7 +42976,7 @@ const VerifyRoutePack = struct {
 };
 
 fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?VerifyRoutePack {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or top_k != 10 or ids.ctx == null or mlx.mlx_array_dtype(ids) != .uint32) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or top_k != 10 or ids.ctx == null or mlx.mlx_array_dtype(ids) != .uint32) return null;
     const shape = mlx.getShape(ids);
     if (shape.len != 1 or shape[0] < 20 or shape[0] > 320 or @mod(shape[0], 10) != 0) return null;
     const kernel = blk: {
@@ -42990,7 +43017,7 @@ fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?Verify
 }
 
 fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.mlx_array, experts: c_int) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or experts <= 0) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or experts <= 0) return null;
     if (x.ctx == null or lhs.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(lhs) != .uint32) return null;
     const xs = mlx.getShape(x);
     const ix = mlx.getShape(lhs);
@@ -43056,7 +43083,7 @@ const VerifyWideKey = struct { m: c_int, n: c_int, k: c_int, nv: c_int };
 var verify_wide_configs = QsaCfgCache(VerifyWideKey, 1){};
 
 fn verifyWideProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, nv: c_int) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or (nv != 4 and nv != 6 and nv != 8 and nv != 12)) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or (nv != 4 and nv != 6 and nv != 8 and nv != 12)) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -43123,7 +43150,7 @@ fn verifyLmHeadProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
 }
 
 fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int, comptime kind: VerifyProjectionKind) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or widths.len < 2 or widths.len > 8) return null;
+    if (!mlx.streamIsMetal(s) or !verifySharedHardware() or widths.len < 2 or widths.len > 8) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or
         mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
@@ -43160,7 +43187,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
 
 /// One row per slot's decode tick, any affine8 group size: each row is computed as the single-row qmv computes it.
 fn decodeRowsProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, widths: []const c_int) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or widths.len < 2 or widths.len > 8) return null;
+    if (!mlx.streamIsMetal(s) or widths.len < 2 or widths.len > 8) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
@@ -43502,7 +43529,7 @@ test "exl3 MTP rows wider than the decode arm refuse by Exl3MtpRowsExceedDecode"
 test "exl3 MTP fused rows match N solo calls on the same kernel" {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const exl3 = expert_exl3;
     const fixture = exl3.fixtures.k4;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -43777,7 +43804,7 @@ const Exl3MoeHarness = struct {
 test "exl3 MoE prefill chunks return live mlx bytes to baseline" {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     var h = try Exl3MoeHarness.init(arena.allocator(), s, expert_exl3_kernels.DECODE_ROWS_MAX * 2, 53);
@@ -44017,7 +44044,7 @@ const MimoExl3MoeHarness = struct {
 fn mimoExl3ForwardMatchesHost(rate: expert_exl3.Rate, rows: usize, seed: u64) !void {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -44031,7 +44058,7 @@ fn mimoExl3ForwardMatchesHost(rate: expert_exl3.Rate, rows: usize, seed: u64) !v
 fn exl3CodebookFollowsModel(rows: usize) !void {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -44065,7 +44092,7 @@ test "mimo_v2 EXL3 resident MoE prefill rows match the host SwiGLU oracle at K2.
 fn mimoExl3DistinctRouting(rows: usize) !void {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -44193,7 +44220,7 @@ test "mimo_v2 EXL3 real shard routed fork matches CPU dump oracle" {
     const layer = try std.fmt.parseInt(u32, std.mem.span(layer_text), 10);
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -44295,7 +44322,7 @@ test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {
     const path = std.c.getenv("MIMO_SLICED_REAL_FIXTURE") orelse return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -44358,7 +44385,7 @@ test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {
 test "exl3 MoE answers the shared-expert standin with the routed sum" {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     var h = try Exl3MoeHarness.init(arena.allocator(), s, expert_exl3_kernels.DECODE_ROWS_MAX * 2, 59);
@@ -47810,7 +47837,7 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 test "two-chunk prefill capture drops the chunk parent after the boundary eval" {
     const t = std.testing;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const rows: c_int = 2048;
     const dim: c_int = 2048;
     const keep: c_int = 8;
@@ -50147,7 +50174,7 @@ test "fused hyper-connection read keeps one config set per row count, inject and
     // Reads that differ only in inject or pending write keep their own configs: alternating
     // them builds nothing after the first pass.
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     hc_fused_override = true;
     defer hc_fused_override = null;
     const HC: c_int = 4;
@@ -60256,7 +60283,7 @@ test "gatherQsa256 NAX: top-512 selection and partial causal tail vs f32 gather-
 test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the stock arm" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     qsa_gather_override = true;
     defer qsa_gather_override = null;
     const saved_nax = qsa_nax_override;
@@ -60299,7 +60326,7 @@ test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaNaxOsOk()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     qsa_gather_override = true;
     defer qsa_gather_override = null;
     const saved_nax = qsa_nax_override;
@@ -60404,7 +60431,7 @@ test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
 test "gatherQsa256: declines a non-GPU stream before kernel selection" {
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    try std.testing.expect(!mlx.streamIsGpu(cpu));
+    try std.testing.expect(!mlx.streamIsMetal(cpu));
     qsa_gather_override = true;
     defer qsa_gather_override = null;
     var prng = std.Random.DefaultPrng.init(0xc0);
@@ -70788,7 +70815,7 @@ test "qsa score fused: a probe mismatch latches the composed arm" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const saved_override = qsa_score_fused_override;
     const saved_flip = qsa_score_probe_flip_override;
     const saved_env = qsa_score_fused_env;
@@ -70823,7 +70850,7 @@ test "qsa score fused: probe passes on this machine" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     if (!qsaScoreTf32Enabled()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const saved_override = qsa_score_fused_override;
     const saved_flip = qsa_score_probe_flip_override;
     defer {
@@ -71149,7 +71176,7 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
         defer _ = mlx.mlx_array_free(q32);
         try mlx.check(mlx.mlx_astype(&q32, q_bf, .float32, s));
         const fused = qsaScoreFusedEligibleFrom(q32, entry.qsa_pooled) and
-            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(s);
+            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsMetal(s);
         try testing.expect(!fused);
         _ = try xfm.qsaScoreOperand(&entry, 1, nb, 128, fused);
         try testing.expect(entry.qsa_score_bank.ctx != null);
@@ -73308,7 +73335,7 @@ fn seSlots(alloc: std.mem.Allocator, rows: usize, topk: usize, u: usize) ![]i32 
 test "streamed expert kernel arm is no worse than the composite arm against fp32 truth" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 2560;
     const inter: c_int = 640;
     const topk: c_int = 10;
@@ -73467,7 +73494,7 @@ test "the streamed expert kernel arm is switched off by SUSHI_EXPERT_BF16_KERNEL
 
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 64;
     const inter: c_int = 32;
     const u: c_int = 8;
@@ -73527,7 +73554,7 @@ test "the streamed expert kernel arm is switched off by SUSHI_EXPERT_BF16_KERNEL
 test "imatrix capture keys the streamed MoE statistics on GLOBAL expert ids, on every arm" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 64;
     const inter: c_int = 32;
     const u: c_int = 8;
@@ -73642,7 +73669,7 @@ fn imxQuantBank(s: mlx.mlx_stream, alloc: std.mem.Allocator, rnd: std.Random, e:
 test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's global ids" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 128;
     const inter: c_int = 64;
     const u: c_int = 4; // experts the slab holds; global id = slot + u
@@ -73781,7 +73808,7 @@ test "imatrix capture on the streamed QUANTIZED MoE path keys the routing's glob
 test "a streamed layer's imatrix tap views the routing ids and is absent with no capture" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const ids_host = [_]i32{ 7, 3, 1, 5 };
     const ids = mlx.mlx_array_new_data(&ids_host, &[_]c_int{ 1, 2, 2 }, 3, .int32);
     defer _ = mlx.mlx_array_free(ids);
@@ -73801,7 +73828,7 @@ test "a streamed layer's imatrix tap views the routing ids and is absent with no
 test "streamed expert compute refuses a misaligned slab by name" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 64;
     const inter: c_int = 32;
     const u: c_int = 8;
@@ -73873,7 +73900,7 @@ test "streamed expert compute refuses a misaligned slab by name" {
 test "streamed expert compute falls back to the composite arm past the kernel row cap" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const hidden: c_int = 64;
     const inter: c_int = 32;
     const u: c_int = 8;
@@ -74106,7 +74133,7 @@ test "a streamed quantized slab matches the resident bank through the same kerne
 
 test "exl3 shared add releases routed output study3" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     var xfm: Transformer = undefined;
     xfm.config = .{};
     xfm.bits_cache = .{};

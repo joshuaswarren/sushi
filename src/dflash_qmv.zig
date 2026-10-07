@@ -48,7 +48,7 @@ var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 var configs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 
 pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("transformer.zig").verifySharedHardware()) return null;
+    if (!mlx.streamIsMetal(s) or !@import("transformer.zig").verifySharedHardware()) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -97,7 +97,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx
 }
 
 test "DFlash A4 eight-row FFN projection matches MLX exactly" {
-    if (mlx.noGpuBackend() or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !mlx.streamIsMetal(mlx.gpuStream()) or !@import("transformer.zig").verifySharedHardware()) return error.SkipZigTest;
     const Ops = @import("glm5_model.zig").Ops;
     const fixture = @import("dflash.zig").TinyFix;
     for ([_][2]c_int{ .{ 4096, 12288 }, .{ 12288, 4096 } }) |nk| {

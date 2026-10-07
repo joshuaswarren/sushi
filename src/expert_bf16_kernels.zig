@@ -290,7 +290,7 @@ pub fn gateUpSwiglu(
     slab: mlx.mlx_array,
     slots: mlx.mlx_array,
 ) !mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (!mlx.streamIsMetal(s)) return error.MetalKernelNeedsGpuStream;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(slab) != .bfloat16) return error.ExpectedBf16;
     const xsh = mlx.getShape(x);
     if (xsh.len != 2) return error.BadActivationShape;
@@ -363,7 +363,7 @@ pub fn downReduce(
     slots: mlx.mlx_array,
     weights: mlx.mlx_array,
 ) !mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (!mlx.streamIsMetal(s)) return error.MetalKernelNeedsGpuStream;
     if (mlx.mlx_array_dtype(h) != .bfloat16 or mlx.mlx_array_dtype(down) != .bfloat16) return error.ExpectedBf16;
     if (mlx.mlx_array_dtype(weights) != .float32) return error.ExpectedF32Weights;
     const hsh = mlx.getShape(h);
@@ -722,7 +722,7 @@ fn runDownShape(alloc: std.mem.Allocator, s: mlx.mlx_stream, rnd: std.Random, U:
 
 test "bf16 slab gate+up+SwiGLU is no worse than the gather_mm reference against fp32 truth" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xB16C0DE1);
     const rnd = prng.random();
@@ -735,7 +735,7 @@ test "bf16 slab gate+up+SwiGLU is no worse than the gather_mm reference against 
 
 test "bf16 slab down+reduce is no worse than the gather_mm reference against fp32 truth" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xD0117EED);
     const rnd = prng.random();
@@ -748,7 +748,7 @@ test "bf16 slab down+reduce is no worse than the gather_mm reference against fp3
 
 test "bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x9E77E57);
     const rnd = prng.random();
@@ -773,7 +773,7 @@ const PARITY_VARIANTS = [_]struct { lanes: c_int, rpl: c_int, groups: c_int, sta
 
 test "bf16 slab kernels hold parity at every lane split and unroll width" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x1A4E5);
     const rnd = prng.random();
@@ -805,7 +805,7 @@ test "bf16 slab kernels hold parity at every lane split and unroll width" {
 
 test "bf16 slab down+reduce sums the top-k partials in ascending k order" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     const U: c_int = 4;
     const R: c_int = 1;
@@ -863,7 +863,7 @@ test "bf16 slab down kernel is preferred only at or past the measured crossover"
 
 test "bf16 slab kernels decline outside their contract" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xDEC11E);
     const rnd = prng.random();

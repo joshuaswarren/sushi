@@ -398,7 +398,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         .head_kv_group = head.cache.config.group_size,
     };
     const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
-    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable());
+    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsMetal(target.s) and transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable());
     if (mixed != .generic) {
         if (!qwen4_mixed_profile_logged) {
             qwen4_mixed_profile_logged = true;
@@ -3414,7 +3414,7 @@ fn getTop32Final() !mlx.mlx_fast_metal_kernel {
 /// NaN above every number. `rows` rides as a template int (stable per model,
 /// so MLX caches one specialization per vocab width).
 pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
-    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (!mlx.streamIsMetal(s)) return error.MetalKernelNeedsGpuStream;
     if (rows < TOP32_MIN_ROWS) return error.UnsupportedTop32Shape;
     const per_thread = @divTrunc(rows + TOP32_TILES * TOP32_TG - 1, TOP32_TILES * TOP32_TG);
     if (per_thread > 32) return error.UnsupportedTop32Shape;
@@ -5622,7 +5622,7 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 }
 
 test "mtp: row-axis coarse logits equal each solo readout" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !mlx.streamIsMetal(mlx.gpuStream())) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
     defer fx.deinit();

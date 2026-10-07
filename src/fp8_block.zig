@@ -516,8 +516,7 @@ fn freeOutputs(out: []mlx.mlx_array) void {
     }
 }
 
-fn checkWeight(s: mlx.mlx_stream, w: mlx.mlx_array, scales: mlx.mlx_array, split: RowSplit, outs: usize) !c_int {
-    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+fn checkWeight(_: mlx.mlx_stream, w: mlx.mlx_array, scales: mlx.mlx_array, split: RowSplit, outs: usize) !c_int {
     if (mlx.mlx_array_dtype(w) != .uint8) return error.Fp8WeightNotU8;
     if (mlx.mlx_array_dtype(scales) != .float32) return error.Fp8ScalesNotF32;
     const wsh = mlx.getShape(w);
@@ -614,7 +613,8 @@ fn projectRoute(
     }
     if (m <= 0) return error.Fp8ShapeMismatch;
 
-    if (tile and x_dtype == .bfloat16 and tile_min_rows > 0 and m >= tile_min_rows and m <= tile_max_rows) {
+    const metal = mlx.streamIsMetal(s);
+    if (metal and tile and x_dtype == .bfloat16 and tile_min_rows > 0 and m >= tile_min_rows and m <= tile_max_rows) {
         const plan = tilePlan(m);
         var rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rows);
@@ -643,7 +643,7 @@ fn projectRoute(
         return;
     }
 
-    if (m <= gemv_max_rows) {
+    if (metal and m <= gemv_max_rows) {
         const key = gemvKey(x_dtype, m, k, split);
         var flat: [3]mlx.mlx_array = .{ .{}, .{}, .{} };
         defer for (&flat) |*a| if (a.ctx != null) {
@@ -685,8 +685,77 @@ fn projectRoute(
 /// product. Caller frees `out[0..split.outputs()]`.
 pub fn dequantize(s: mlx.mlx_stream, w: mlx.mlx_array, scales: mlx.mlx_array, split: RowSplit, out: []mlx.mlx_array) !void {
     const k = try checkWeight(s, w, scales, split, out.len);
+    if (!mlx.streamIsMetal(s)) return dequantPlain(s, w, scales, split, k, out);
     const key = CfgKey{ .kind = .dequant, .dtype = .bfloat16, .m = 0, .k = k, .tp = split.tp, .parts = split.parts, .nr = 0, .sgs = 0, .tiles = 0 };
     try apply(s, .dequant, &.{ w, scales }, key, split, out);
+}
+
+/// The dequant kernel's arithmetic in stock ops for non-Metal backends: one
+/// `bf16(f32(code) * f32(tile scale))` rounding per element over each rank's
+/// contiguous row range, then the rank-sliced row block per output part.
+fn dequantPlain(s: mlx.mlx_stream, w: mlx.mlx_array, scales: mlx.mlx_array, split: RowSplit, k: c_int, out: []mlx.mlx_array) !void {
+    const block: c_int = @intCast(BLOCK);
+    const rpr: c_int = @intCast(split.rowsPerRank());
+    const bpr: c_int = @intCast(split.blocksPerRank());
+    const n: c_int = @intCast(split.tp * split.rowsPerRank());
+    const kb = @divExact(k, block);
+    const rank_rows = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(rank_rows);
+    for (0..split.tp) |rank| {
+        const base: c_int = @as(c_int, @intCast(rank)) * bpr;
+        var rank_scales = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rank_scales);
+        try mlx.check(mlx.mlx_slice(&rank_scales, scales, &.{ base, 0 }, 2, &.{ base + bpr, kb }, 2, &.{ 1, 1 }, 2, s));
+        var wide = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wide);
+        try mlx.check(mlx.mlx_expand_dims(&wide, rank_scales, 1, s));
+        var staged = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(staged);
+        try mlx.check(mlx.mlx_broadcast_to(&staged, wide, &.{ bpr, block, kb }, 3, s));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, staged, &.{ bpr * block, kb }, 2, s));
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_slice(&rows, flat, &.{ 0, 0 }, 2, &.{ rpr, kb }, 2, &.{ 1, 1 }, 2, s));
+        try mlx.check(mlx.mlx_vector_array_append_value(rank_rows, rows));
+    }
+    var sc_rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc_rows);
+    try mlx.check(mlx.mlx_concatenate_axis(&sc_rows, rank_rows, 0, s));
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    try mlx.check(mlx.mlx_astype(&wf, w, .float32, s));
+    var w3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w3);
+    try mlx.check(mlx.mlx_reshape(&w3, wf, &.{ n, kb, block }, 3, s));
+    var s3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s3);
+    try mlx.check(mlx.mlx_expand_dims(&s3, sc_rows, 2, s));
+    var product = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(product);
+    try mlx.check(mlx.mlx_multiply(&product, w3, s3, s));
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_astype(&deq, product, .bfloat16, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_reshape(&dense, deq, &.{ n, k }, 2, s));
+    var off: c_int = 0;
+    for (0..split.outputs()) |p| {
+        const rows: c_int = @intCast(split.parts[p]);
+        const pieces = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(pieces);
+        for (0..split.tp) |rank| {
+            const base: c_int = @as(c_int, @intCast(rank)) * rpr + off;
+            var piece = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(piece);
+            try mlx.check(mlx.mlx_slice(&piece, dense, &.{ base, 0 }, 2, &.{ base + rows, k }, 2, &.{ 1, 1 }, 2, s));
+            try mlx.check(mlx.mlx_vector_array_append_value(pieces, piece));
+        }
+        try mlx.check(mlx.mlx_concatenate_axis(&out[p], pieces, 0, s));
+        off += rows;
+    }
 }
 
 /// The dense case: one output, `x @ W^T`.
@@ -880,7 +949,7 @@ const PARITY_SPLITS = [_]RowSplit{
 
 test "fp8 block GEMV is no worse than the bf16-dequant route against fp64 truth" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     for (PARITY_SEEDS) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -919,7 +988,7 @@ test "fp8 block GEMV is no worse than the bf16-dequant route against fp64 truth"
 
 test "fp8 block GEMV in f32 errs by no more than an f32 accumulation over the summands" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     for (PARITY_SEEDS) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -981,7 +1050,7 @@ fn expectTileWithinBar(tw: *const TestWeight, x: []const f32, m: usize, part: us
 }
 
 fn naxForTest() bool {
-    return mlx.streamIsGpu(mlx.gpuStream()) and @import("transformer.zig").verifyQmmNaxAvailable();
+    return mlx.streamIsMetal(mlx.gpuStream()) and @import("transformer.zig").verifyQmmNaxAvailable();
 }
 
 test "fp8 block serving tile stays within bf16 rounding plus an f32 sum over the dequant route's weights" {
@@ -1109,7 +1178,7 @@ test "fp8 block serving widths outside the tile, and every width under the refer
 
 test "fp8 block dequant writes the bf16 route's bytes for every code" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xDE0A7);
     const rnd = prng.random();
@@ -1142,7 +1211,7 @@ test "fp8 block dequant writes the bf16 route's bytes for every code" {
 
 test "fp8 block QKV split routes rank-local rows and their partial tiles" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     for ([_]u32{ 4, 8 }) |tp| {
         const q_per = 128;
@@ -1196,7 +1265,7 @@ test "fp8 block QKV split routes rank-local rows and their partial tiles" {
 
 test "fp8 block QKV folds the value scale into V as the composed multiply rounds it" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7A1E);
     const rnd = prng.random();
@@ -1289,7 +1358,7 @@ fn gpuRandomFp8(s: mlx.mlx_stream, split: RowSplit, k: c_int, seed: u64) !struct
 
 test "fp8 block direct GEMV keeps each row's one-row arithmetic up to 8 rows at MiMo's trunk shapes" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const alloc = testing.allocator;
     const shapes = [_]struct { split: RowSplit, k: c_int }{
         .{ .split = .{ .tp = 4, .parts = .{ 3072, 192, 128 }, .v_scale = 0.707 }, .k = 4096 },
@@ -1338,7 +1407,7 @@ test "fp8 block direct GEMV keeps each row's one-row arithmetic up to 8 rows at 
 
 test "fp8 block refuses weights outside its contract by name" {
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const codes: [128 * 128]u8 = @splat(0x38);
     const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ 128, 128 }, 2, .uint8);
     defer _ = mlx.mlx_array_free(w);
@@ -1538,7 +1607,7 @@ test "fp8 block microbench vs bf16 and affine-8 at MiMo's trunk shapes (SUSHI_FP
     const raw = std.c.getenv("SUSHI_FP8_UBENCH") orelse return error.SkipZigTest;
     if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    if (!mlx.streamIsMetal(s)) return error.SkipZigTest;
     const armed_tile = tile_nax;
     defer tile_nax = armed_tile;
     tile_nax = naxForTest();

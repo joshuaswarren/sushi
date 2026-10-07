@@ -1021,7 +1021,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // GPU streams only: the CPU stream is the host-reference/test path, whose
     // numerics the python oracle models with dequantized operands (and whose
     // decode-equivalence gate is strict BECAUSE both sides hit one gemm).
-    if (woAQmmEnabled() and mlx.streamIsGpu(s)) {
+    if (woAQmmEnabled() and mlx.streamIsMetal(s)) {
         wo_a_q3 = try a.alloc(Q3, dw.layers.len);
         for (wo_a_q3, dw.layers) |*q3, *ly| {
             q3.* = .{
@@ -1061,7 +1061,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // only — the CPU stream is the host-reference/test path whose strict
     // gates assume the dense operand.
     var comp_in_q: []?CompInQ = &.{};
-    if (transformer.decodeAttnQuantExplicit() and mlx.streamIsGpu(s)) {
+    if (transformer.decodeAttnQuantExplicit() and mlx.streamIsMetal(s)) {
         comp_in_q = try a.alloc(?CompInQ, dw.layers.len);
         var q_bytes: usize = 0;
         for (comp_in_q, hl) |*slot, *h| {
@@ -1111,7 +1111,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // lazy-decode GPU embed table (bf16; host embed_f32 = f32 of the same
     // bf16 values, so the two lookup paths feed bit-identical rows)
     var embed_g: ?mlx.mlx_array = null;
-    if (mlx.streamIsGpu(s) and lazyDecodeEnabled()) {
+    if (mlx.streamIsMetal(s) and lazyDecodeEnabled()) {
         var eb = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&eb, embed_deq, .bfloat16, s));
         try mlx.check(mlx.mlx_array_eval(eb));
@@ -1132,7 +1132,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         break :blk arr;
     };
     const sink_env_off = if (std.c.getenv("SUSHI_DSV4_SINKHORN")) |v| v[0] == '0' else false;
-    const sink_k = if (mlx.streamIsGpu(s) and !sink_env_off)
+    const sink_k = if (mlx.streamIsMetal(s) and !sink_env_off)
         buildSinkhornKernel(hc, cfg.dsv4_hc_sinkhorn_iters)
     else
         null;
@@ -1676,7 +1676,7 @@ fn gpuEmitEnabled() bool {
 /// GPU emission serves GPU streams only: the CPU stream is the host
 /// reference/test path whose strict gates assume host emission.
 fn gpuEmitActive(m: *const Dsv4Model) bool {
-    return gpuEmitEnabled() and mlx.streamIsGpu(m.s);
+    return gpuEmitEnabled() and mlx.streamIsMetal(m.s);
 }
 
 /// Fused window-emission kernel kill switch (`SUSHI_DSV4_EMIT_KERNEL=0`
@@ -2093,7 +2093,7 @@ var moe_gateup_cfg_key: MoeGateUpKey = std.mem.zeroes(MoeGateUpKey);
 /// table). Returns [1, TOPK, 1, N] bf16 (the composed `act` shape), or null
 /// to decline (kill switch, ineligible geometry, build failure).
 fn moeGateUpFused(m: *const Dsv4Model, xe: mlx.mlx_array, q_gate: *const Q, q_up: *const Q, ind: mlx.mlx_array, k: usize) !?mlx.mlx_array {
-    if (!moeGateUpEnabled() or !mlx.streamIsGpu(m.s)) return null;
+    if (!moeGateUpEnabled() or !mlx.streamIsMetal(m.s)) return null;
     const bits = q_gate.qp.bits;
     const gs = q_gate.qp.group_size;
     // eligibility is the kernel's own conditions, never a model list
@@ -6423,7 +6423,7 @@ fn headLogitsLazyGpu(m: *const Dsv4Model, stream_g: mlx.mlx_array) !mlx.mlx_arra
 fn headLogitsGpu(m: *const Dsv4Model, gpa: std.mem.Allocator, alloc: std.mem.Allocator, stream_g: mlx.mlx_array) ![]f32 {
     const hcm = m.hc;
     const d = m.dim;
-    if (mlx.streamIsGpu(m.s)) {
+    if (mlx.streamIsMetal(m.s)) {
         const logits_g = try headLogitsLazyGpu(m, stream_g);
         defer _ = mlx.mlx_array_free(logits_g);
         return try toHostF32(gpa, logits_g, m.vocab, m.s);
@@ -6990,7 +6990,7 @@ fn emitWindowsKernel(
     pre_n: usize,
     used_c: usize,
 ) !bool {
-    if (!emitKernelEnabled() or !mlx.streamIsGpu(m.s)) return false; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
+    if (!emitKernelEnabled() or !mlx.streamIsMetal(m.s)) return false; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
     const d = c.head_dim;
     const cd = c.coff * d;
     // eligibility is the kernel's own conditions, never a model list
@@ -7197,7 +7197,7 @@ var sink_sm_cfg_next: usize = 0;
 /// GEMMs (the composed chain is 4 strictly-serial dispatches per layer).
 /// Returns probs [H, TK] f32, or null to decline.
 fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_array, H: usize, TK: usize, scale: f32) !?mlx.mlx_array {
-    if (!sinkSoftmaxEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only
+    if (!sinkSoftmaxEnabled() or !mlx.streamIsMetal(m.s)) return null; // metal_kernel is GPU-only
     if (TK == 0 or H == 0 or H > 65535) return null;
     const kernel = sinkSoftmaxObj() orelse return null;
     const tg: usize = @min(256, std.math.ceilPowerOfTwoAssert(usize, @max(TK, 2)));
@@ -7407,7 +7407,7 @@ fn decChainKernel(
     inverse: bool,
     rr: *const RopeRows,
 ) !?mlx.mlx_array {
-    if (!decChainEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
+    if (!decChainEnabled() or !mlx.streamIsMetal(m.s)) return null; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
     // eligibility is the kernel's own conditions, never a model list
     if (D > 1024 or rd == 0 or rd % 2 != 0 or rd > D) return null;
     if (post == 1 and (D <= rd or (D - rd) % 64 != 0)) return null;
@@ -8277,7 +8277,7 @@ fn headLogitsBatchG(m: *const Dsv4Model, alloc: std.mem.Allocator, stream_g: mlx
     var pre_col = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pre_col);
     const pshape = [_]c_int{ cc, @intCast(hcm), 1 };
-    if (mlx.streamIsGpu(m.s)) {
+    if (mlx.streamIsMetal(m.s)) {
         const prew_g = try headPreWeightsGpu(m, mixes_g, ssum); // [C, hc]
         defer _ = mlx.mlx_array_free(prew_g);
         var pc = mlx.mlx_array_new();
