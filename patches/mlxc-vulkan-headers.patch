@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fcf4ea7..3001cd6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -30,6 +30,9 @@ set(MLX_BUILD_BENCHMARKS OFF)
+ set(MLX_BUILD_PYTHON_BINDINGS OFF)
+ 
+ if(MLX_C_USE_SYSTEM_MLX)
++  # An MLXConfig from the omarchy Vulkan backend links Vulkan::Headers into the
++  # mlx target's interface; the imported target must exist before find_package(MLX).
++  find_package(Vulkan QUIET)
+   find_package(MLX REQUIRED)
+ else()
+   FetchContent_Declare(

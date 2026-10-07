@@ -76,8 +76,10 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing as the macOS script) ──────────
-git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH" 2>/dev/null \
-  || echo "[build-mlx-linux] mlxc patch already applied"
+for p in "$REPO_ROOT"/patches/mlxc-*.patch; do
+  git -C "$MLXC_SRC" apply -p1 "$p" 2>/dev/null \
+    || echo "[build-mlx-linux] $(basename "$p") already applied"
+done
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=ON \
