@@ -3115,7 +3115,7 @@ fn plainMoeFused(
     if (mlx.mlx_array_data_float32(scores)) |p| {
         @memcpy(score_f, p[0..sc_count]);
     } else if (mlx.mlx_array_data_float16(scores)) |p| {
-        for (p[0..sc_count], 0..) |v, i| score_f[i] = exl3.f16BitsToF32(v);
+        for (p[0..sc_count], 0..) |v, i| score_f[i] = @floatCast(v);
     } else if (mlx.mlx_array_data_bfloat16(scores)) |p| {
         for (p[0..sc_count], 0..) |v, i| score_f[i] = @bitCast(@as(u32, v) << 16);
     } else return error.F32Unreadable;
