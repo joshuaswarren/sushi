@@ -139,10 +139,27 @@ pub fn holdsData(dir: []const u8, boundaries: usize) !bool {
     return false;
 }
 
+/// (size, mode, nlink) of an open fd across macOS and Linux (std.c.fstat is
+/// darwin-only in Zig 0.17 and Linux lost the plain Stat layout; statx through
+/// /proc/self/fd keeps this fd-based on both).
+fn fdStat(fd: std.c.fd_t) !struct { size: u64, mode: u32, nlink: u64 } {
+    if (comptime @import("builtin").os.tag == .macos) {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return error.HiddenCaptureOpenFailed;
+        return .{ .size = @intCast(st.size), .mode = @intCast(st.mode), .nlink = st.nlink };
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const proc_path = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{fd}, 0) catch
+        return error.HiddenCaptureOpenFailed;
+    var stx: std.os.linux.Statx = undefined;
+    const linux = std.os.linux;
+    const rc = linux.statx(@bitCast(@as(i32, -100)), proc_path.ptr, 0, linux.STATX.BASIC_STATS, &stx);
+    if (rc != 0) return error.HiddenCaptureOpenFailed;
+    return .{ .size = stx.size, .mode = stx.mode, .nlink = stx.nlink };
+}
+
 fn fdBytes(fd: std.c.fd_t) !u64 {
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return error.HiddenCaptureOpenFailed;
-    return @intCast(st.size);
+    return (try fdStat(fd)).size;
 }
 
 fn truncateFd(fd: std.c.fd_t, bytes: u64) !void {
@@ -161,8 +178,11 @@ fn openAppend(dir: []const u8, name: []const u8) !std.c.fd_t {
     if (std.c._errno().* != @intFromEnum(std.c.E.EXIST)) return error.HiddenCaptureOpenFailed;
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .APPEND = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c._errno().* == @intFromEnum(std.c.E.LOOP)) error.HiddenCaptureNotPrivateFile else error.HiddenCaptureOpenFailed;
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0 or !std.c.S.ISREG(@intCast(st.mode)) or st.nlink != 1) {
+    const st = fdStat(fd) catch {
+        _ = std.c.close(fd);
+        return error.HiddenCaptureNotPrivateFile;
+    };
+    if (!std.c.S.ISREG(@intCast(st.mode)) or st.nlink != 1) {
         _ = std.c.close(fd);
         return error.HiddenCaptureNotPrivateFile;
     }
