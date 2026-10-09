@@ -739,7 +739,8 @@ const PrefetchPool = struct {
             a.destroy(p);
         }
         for (0..N) |i| {
-            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
+            // 128 KiB: glibc aarch64 PTHREAD_STACK_MIN; 64 KiB fails pthread_attr_setstacksize.
+            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, worker, .{ p, i });
             started += 1;
         }
         return p;
