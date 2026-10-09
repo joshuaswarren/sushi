@@ -376,7 +376,7 @@ pub const FillPool = struct {
         var started: usize = 0;
         errdefer pool.shutdown(started);
         for (threads, 0..) |*thread, i| {
-            thread.* = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, workerMain, .{ pool, i });
+            thread.* = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, workerMain, .{ pool, i });
             started += 1;
         }
         return pool;
