@@ -5482,6 +5482,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
         } else |err| {
+            log.err("[scheduler] load error: {s}\n", .{@errorName(err)});
+            if (@errorReturnTrace()) |t| std.debug.dumpStackTrace(t.*);
             recordLoadError(sch, @errorName(err));
             sch.registry.mutex.lockUncancelable(sch.io);
             sch.registry.markErrorLocked(params.entry, @errorName(err));
