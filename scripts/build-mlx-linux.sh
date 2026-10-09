@@ -35,14 +35,15 @@ die() { echo "[build-mlx-linux] ERROR: $*" >&2; exit 1; }
   || die "$OMARCHY_DIR does not look like omarchy-mlx (no scripts/prepare-mlx.sh)"
 
 # Version pins recorded in the stamp: the omarchy mlx source (authoritative —
-# it is what we build), the vendored mlx pin (provenance parity check), mlx-c,
-# and the sushi mlxc patch hash.
+# it is what we build: version AND overlay commit), the vendored mlx pin
+# (provenance parity check), mlx-c, and the sushi mlxc patch hash.
 OMARCHY_MLX_VER="$(grep -oP '^MLX_VERSION=\K.*' "$OMARCHY_DIR/mlx.lock" 2>/dev/null || echo unknown)"
+OMARCHY_SHA="$(git -C "$OMARCHY_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 VENDORED_MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
 MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
 PATCH_SHA="$(sha256sum "$MLXC_PATCH" | cut -c1-12)"
-WANT="mlx=$VENDORED_MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=omarchy-$OMARCHY_MLX_VER"
+WANT="mlx=$VENDORED_MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=omarchy-$OMARCHY_MLX_VER@$OMARCHY_SHA"
 
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.so" ] && [ -f "$STAGE/lib/libmlxc.so" ]; then
   if [ "$(cat "$STAMP")" = "$WANT" ]; then
