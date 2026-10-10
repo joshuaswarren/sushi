@@ -148,12 +148,13 @@ void main() {
         uint gx = gl_WorkGroupID.x / blocks;
         uint blk = gl_WorkGroupID.x % blocks;
         uint e = g_slots[gx];
-        uint base = gx * dim + blk * 128u;
+        uint base = gx * dim + blk * 128u;                 // per-slot buffers (xt*, h32): one row per slot
+        uint xbase = (gx / pc.topk) * dim + blk * 128u;    // x has one row per TOKEN: row = slot / topk
         uint sbase = e * dim + blk * 128u;
         for (uint rr = lid; rr < 128u; rr += 64u) {
             precise float acc = 0.0;
             for (uint k = 0u; k < 128u; k++) {
-                float xv = (mode == 9u) ? g_h32[base + k] : g_x[base + k];
+                float xv = (mode == 9u) ? g_h32[base + k] : g_x[xbase + k];
                 uint sb = (mode == 0u) ? g_suhg[sbase + k]
                         : (mode == 1u) ? g_suhu[sbase + k]
                         : g_suhd[sbase + k];
