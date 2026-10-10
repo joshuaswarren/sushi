@@ -1,0 +1,102 @@
+EXL3 routed MoE for sushi's moeSwigluClamped non-Metal route (M3b). The
+pinned mlx-c @56b2d39 has no surface for the EXL3 pack: sushi's non-Metal
+branch currently runs the host plainMoeFused loop. This adds the mlx-c
+wrapper mlx_fast_exl3_moe forwarding to mlx::core::fast::exl3_moe (added
+to omarchy-mlx by patches/mlx-fast-exl3-moe.patch): it decodes the packed
+trellis banks and runs the routed clamped-SwiGLU MoE (gate upper-clamped,
+up symmetrically clamped, limit == 0 disables). `window` carries sushi's
+runtime codeword-window config; the C ABI has no other channel for it.
+
+--- a/mlx/c/fast.h
++++ b/mlx/c/fast.h
+@@ -98,6 +98,34 @@
+     float eps,
+     const mlx_stream s);
+ 
++/**
++ * Routed EXL3 MoE layer (sushi's moeSwigluClamped non-Metal route).
++ * Decodes the packed trellis banks with the EXL3 reference decoder and
++ * runs the routed clamped-SwiGLU MoE over the router slots; the gate
++ * clamps above `limit`, the up branch clamps to [-limit, limit] and
++ * `limit == 0` disables clamping. `window` is the pack's codeword
++ * window width in bits (sushi's runtime window config).
++ */
++int mlx_fast_exl3_moe(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array gate_trellis,
++    const mlx_array gate_suh,
++    const mlx_array gate_svh,
++    const mlx_array up_trellis,
++    const mlx_array up_suh,
++    const mlx_array up_svh,
++    const mlx_array down_trellis,
++    const mlx_array down_suh,
++    const mlx_array down_svh,
++    const mlx_array slots,
++    const mlx_array scores,
++    int topk,
++    int window,
++    float limit,
++    mlx_dtype out_dtype,
++    const mlx_stream s);
++
+ typedef struct mlx_fast_metal_kernel_config_ {
+   void* ctx;
+ } mlx_fast_metal_kernel_config;
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -276,6 +276,53 @@
+   return 0;
+ }
+ 
++extern "C" int mlx_fast_exl3_moe(
++    mlx_array* res,
++    const mlx_array x,
++    const mlx_array gate_trellis,
++    const mlx_array gate_suh,
++    const mlx_array gate_svh,
++    const mlx_array up_trellis,
++    const mlx_array up_suh,
++    const mlx_array up_svh,
++    const mlx_array down_trellis,
++    const mlx_array down_suh,
++    const mlx_array down_svh,
++    const mlx_array slots,
++    const mlx_array scores,
++    int topk,
++    int window,
++    float limit,
++    mlx_dtype out_dtype,
++    const mlx_stream s) {
++  try {
++    mlx_array_set_(
++        *res,
++        mlx::core::fast::exl3_moe(
++            mlx_array_get_(x),
++            mlx_array_get_(gate_trellis),
++            mlx_array_get_(gate_suh),
++            mlx_array_get_(gate_svh),
++            mlx_array_get_(up_trellis),
++            mlx_array_get_(up_suh),
++            mlx_array_get_(up_svh),
++            mlx_array_get_(down_trellis),
++            mlx_array_get_(down_suh),
++            mlx_array_get_(down_svh),
++            mlx_array_get_(slots),
++            mlx_array_get_(scores),
++            topk,
++            window,
++            limit,
++            mlx_dtype_to_cpp(out_dtype),
++            mlx_stream_get_(s)));
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
++
+ struct mlx_fast_metal_kernel_config_cpp_ {
+   std::vector<mlx::core::Shape> output_shapes;
+   std::vector<mlx::core::Dtype> output_dtypes;
