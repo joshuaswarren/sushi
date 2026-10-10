@@ -142,7 +142,7 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(k));
     if (rows < 2 or rows > 32) return null;
     const gs: c_int = @intCast(geom.group_size);
-    if (!mlx.streamIsGpu(s) or k < 256 or @mod(n, 8) != 0 or
+    if (!mlx.streamIsMetal(s) or k < 256 or @mod(n, 8) != 0 or
         mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16)
         return try serialRows(s, x, w, sc, bi, gs, @intCast(rows));
     if (kernel == null) {
@@ -247,7 +247,7 @@ var f32_gemv_next: usize = 0;
 /// Every row of `x` against the transposed f32 `w` [K, N] in one dispatch, each row the M=1 MLX gemv
 /// bit for bit. Null outside the one gemv configuration it reproduces (MiMo's router is inside it).
 fn f32GemvRows(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .float32 or mlx.mlx_array_dtype(w) != .float32) return null;
+    if (!mlx.streamIsMetal(s) or mlx.mlx_array_dtype(x) != .float32 or mlx.mlx_array_dtype(w) != .float32) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
     const k = ws[0];

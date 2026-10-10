@@ -73,7 +73,7 @@ pub var calls: [2]usize = .{ 0, 0 };
 var logged: [2]bool = .{ false, false };
 
 pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or x.ctx == null or w.ctx == null) return null;
+    if (!mlx.streamIsMetal(s) or x.ctx == null or w.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
