@@ -178,7 +178,7 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
         .bindingCount = MOE_BINDINGS, .pBindings = rb };
     VkDescriptorSetLayout layout;
     VKC(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &layout));
-    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 36 };
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 40 };
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &layout,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
@@ -318,7 +318,7 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
         }
 
         float limitBits; memcpy(&limitBits, &C.limit, 4);
-        uint32_t pc8[9] = { 0, C.hidden, C.inter, C.topk, C.n, C.mask, 0, 0, 0 };
+        uint32_t pc8[10] = { 0, C.hidden, C.inter, C.topk, C.n, C.mask, 0, 0, 0, 16 };
         memcpy(&pc8[6], &limitBits, 4);
         /* One submit per dispatch: this llvmpipe build does not honor
          * vkCmdPipelineBarrier between compute dispatches (kernel B reads
@@ -339,17 +339,24 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
          * loop after ~6-8 iterations (acc[393+] diverges, acc[512+] never
          * written); slabbing keeps the exact accumulation order (k ascending)
          * via read-modify-write across dispatches. */
-        uint32_t gSlabs = (inTiles + 15) / 16, dSlabs = (tTiles + 15) / 16;
+        /* EXL3_SLAB = stage-B in-tiles per dispatch (default 16, the lavapipe workaround). 0 = one dispatch per row,
+         * the exact reference accumulation order (use on a driver that runs the whole tk loop). */
+        const char *slabEnv = getenv("EXL3_SLAB");
+        uint32_t slab = slabEnv ? (uint32_t)strtoul(slabEnv, NULL, 10) : 16u;
+        uint32_t gTiles = (uint32_t)(hidden / 16), dTiles = (uint32_t)(inter / 16);
+        if (slab == 0) slab = gTiles > dTiles ? gTiles : dTiles;
+        pc8[9] = slab;
+        uint32_t gSlabs = (gTiles + slab - 1) / slab, dSlabs = (dTiles + slab - 1) / slab;
         for (size_t g = 0; g < rts; g++) {
             steps[n++] = (MStep){ 2, (uint32_t)g, inTiles };
             for (uint32_t sl2 = 0; sl2 < gSlabs; sl2++)
-                steps[n++] = (MStep){ 3, (uint32_t)g | ((sl2 * 16) << 16), 1 };
+                steps[n++] = (MStep){ 3, (uint32_t)g | ((sl2 * slab) << 16), 1 };
         }
         steps[n++] = (MStep){ 10, 0, (uint32_t)(rts * (inter / 128)) };
         for (size_t g = 0; g < rts; g++) {
             steps[n++] = (MStep){ 4, (uint32_t)g, inTiles };
             for (uint32_t sl2 = 0; sl2 < gSlabs; sl2++)
-                steps[n++] = (MStep){ 5, (uint32_t)g | ((sl2 * 16) << 16), 1 };
+                steps[n++] = (MStep){ 5, (uint32_t)g | ((sl2 * slab) << 16), 1 };
         }
         steps[n++] = (MStep){ 11, 0, (uint32_t)(rts * (inter / 128)) };
         steps[n++] = (MStep){ 8, 0, (uint32_t)rts };
@@ -357,7 +364,7 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
             steps[n++] = (MStep){ 9, (uint32_t)g, (uint32_t)(inter / 128) }; /* gx via push */
             steps[n++] = (MStep){ 6, (uint32_t)g, tTiles };
             for (uint32_t sl2 = 0; sl2 < dSlabs; sl2++)
-                steps[n++] = (MStep){ 7, (uint32_t)g | ((sl2 * 16) << 16), 1 };
+                steps[n++] = (MStep){ 7, (uint32_t)g | ((sl2 * slab) << 16), 1 };
         }
         steps[n++] = (MStep){ 12, 0, (uint32_t)(rts * (hidden / 128)) };
         steps[n++] = (MStep){ 13, 0, (uint32_t)(rows * ((hidden + 63) / 64)) };
@@ -373,7 +380,7 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
             pc8[8] = steps[st].gx >> 16;  /* stage-B tile slab */
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[0]);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
-            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 36, pc8);
+            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 40, pc8);
             vkCmdDispatch(cmd, steps[st].grid, 1, 1);
             VKC(vkEndCommandBuffer(cmd));
             VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,

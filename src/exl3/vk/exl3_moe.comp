@@ -53,9 +53,9 @@ layout(push_constant) uniform PC {
     uint mask;      // codeword window mask
     uint limitBits; // SwiGLU clamp magnitude as f32 bits, 0 = no clamp
     uint gx;        // row*topk + slot for the per-slot modes
-    uint tkLo;      // stage-B tile slab start (tk loop runs TK_SLAB tiles)
+    uint tkLo;      // stage-B tile slab start
+    uint tkN;       // stage-B tile slab length (in-tiles per dispatch; whole row = unslabbed, exact reference order)
 } pc;
-const uint TK_SLAB = 16u;
 
 const float HAD_SCALE = 0.08838834764831845;
 const uint MCG_MULT = 0xCBAC1FEDu;
@@ -222,7 +222,7 @@ void main() {
         // sequential reference (visible as 1-ulp f16 flips downstream).
         uint gx = pc.gx;
         uint tkLo = pc.tkLo;
-        uint tkHi = tkLo + TK_SLAB;
+        uint tkHi = tkLo + pc.tkN;
         uint inDim  = (mode == 7u) ? inter  : hidden;
         uint outDim = (mode == 7u) ? hidden : inter;
         uint inTiles = inDim >> 4;
