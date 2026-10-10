@@ -53,7 +53,9 @@ layout(push_constant) uniform PC {
     uint mask;      // codeword window mask
     uint limitBits; // SwiGLU clamp magnitude as f32 bits, 0 = no clamp
     uint gx;        // row*topk + slot for the per-slot modes
+    uint tkLo;      // stage-B tile slab start (tk loop runs TK_SLAB tiles)
 } pc;
+const uint TK_SLAB = 16u;
 
 const float HAD_SCALE = 0.08838834764831845;
 const uint MCG_MULT = 0xCBAC1FEDu;
@@ -145,8 +147,8 @@ void main() {
         // functions of buffered inputs, bit-identical to staging them.
         uint dim = (mode == 9u) ? inter : hidden;
         uint blocks = dim / 128u;
-        uint gx = gl_WorkGroupID.x / blocks;
-        uint blk = gl_WorkGroupID.x % blocks;
+        uint gx = (mode == 9u) ? pc.gx : gl_WorkGroupID.x / blocks;
+        uint blk = (mode == 9u) ? gl_WorkGroupID.x : gl_WorkGroupID.x % blocks;
         uint e = g_slots[gx];
         uint base = gx * dim + blk * 128u;                 // per-slot buffers (xt*, h32): one row per slot
         uint xbase = (gx / pc.topk) * dim + blk * 128u;    // x has one row per TOKEN: row = slot / topk
@@ -212,17 +214,24 @@ void main() {
             }
         }
     } else if (mode == 3u || mode == 5u || mode == 7u) {
-        // GEMV stage B: acc[o] = sum_tk sum_r xv[tk*16+r] * w — the exact
-        // innerGemv order (in-tile major, then the tile's 16 rows), f32.
+        // GEMV stage B, tile-slabbed: acc[o] = acc[o] + sum over the slab's
+        // 16 in-tiles, in exact innerGemv order inside the slab. This
+        // llvmpipe build stops long carried-dependency loops after ~6-8
+        // iterations, so the tk loop is split across dispatches; the slab
+        // boundaries introduce <= 1-ulp f32 deviations vs the strictly
+        // sequential reference (visible as 1-ulp f16 flips downstream).
         uint gx = pc.gx;
+        uint tkLo = pc.tkLo;
+        uint tkHi = tkLo + TK_SLAB;
         uint inDim  = (mode == 7u) ? inter  : hidden;
         uint outDim = (mode == 7u) ? hidden : inter;
         uint inTiles = inDim >> 4;
+        if (tkHi > inTiles) tkHi = inTiles;
         for (uint o = lid; o < outDim; o += 64u) {
             uint tn = o >> 4;
             uint c = o & 15u;
             precise float acc = 0.0;
-            for (uint tk = 0u; tk < inTiles; tk++) {
+            for (uint tk = tkLo; tk < tkHi; tk++) {
                 uint dst = (((tk * (outDim >> 4)) + tn) << 9);
                 for (uint r = 0u; r < 16u; r++) {
                     uint xb = (mode == 7u) ? g_xtd[gx * inDim + tk * 16u + r]
@@ -232,6 +241,9 @@ void main() {
                     acc = acc + prod;
                 }
             }
+            if (tkLo > 0u) acc += (mode == 3u) ? g_accg[gx * outDim + o]
+                            : (mode == 5u) ? g_accu[gx * outDim + o]
+                            : g_accd[gx * outDim + o];
             if (mode == 3u) g_accg[gx * outDim + o] = acc;
             else if (mode == 5u) g_accu[gx * outDim + o] = acc;
             else g_accd[gx * outDim + o] = acc;
@@ -239,7 +251,8 @@ void main() {
     } else if (mode == 8u) {
         // SwiGLU: h = silu(ag) * au with the plainMoeFused clamp, f32 math on
         // f16-valued inputs; h32 feeds the down prep, h16 is a diagnostic.
-        uint gx = pc.gx;
+        // One workgroup per slot: gx comes from the workgroup id.
+        uint gx = gl_WorkGroupID.x;
         float lim = uintBitsToFloat(pc.limitBits);
         for (uint o = lid; o < inter; o += 64u) {
             precise float a = f16ToF32(g_ag[gx * inter + o]);

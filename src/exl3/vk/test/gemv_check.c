@@ -222,6 +222,12 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        printf("C acc[380..392] :");
+        for (size_t o = 380; o <= 392; o++) printf(" %.6g", (double)ag[o]);
+        printf("\n");
+        printf("C acc[508..516] :");
+        for (size_t o = 508; o <= 516; o++) printf(" %.6g", (double)ag[o]);
+        printf("\n");
         for (size_t o = 0; o < inter; o++) ag[o] = f16ToF32(f32ToF16(ag[o]));
         for (size_t blk = 0; blk < inter / 128; blk++) {
             float out[128];
