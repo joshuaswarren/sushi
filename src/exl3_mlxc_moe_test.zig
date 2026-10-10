@@ -41,10 +41,10 @@ fn arrayNewData(data: []const u8, shape: []const c_int, dtype: mlx.mlx_dtype) ml
     );
 }
 
-test "mlx_exl3_moe returns the right shape and dtype" {
+test "mlx_fast_exl3_moe returns the right shape and dtype" {
     const alloc = std.testing.allocator;
-    const tiles_gu: usize = (hidden / 128) * (inter / 128);
-    const tiles_d: usize = (inter / 128) * (hidden / 128);
+    const tiles_gu: usize = (hidden / 16) * (inter / 16);
+    const tiles_d: usize = (inter / 16) * (hidden / 16);
     const packed_n: usize = rate_n;
 
     var prng = std.Random.DefaultPrng.init(0xE8301C);
@@ -84,7 +84,7 @@ test "mlx_exl3_moe returns the right shape and dtype" {
         var used: [experts]bool = @splat(false);
         for (0..topk) |k| {
             var e: u32 = rand.uintLessThan(u32, experts);
-            while (used[e]) e = (e + 1) % experts;
+            while (used[e]) e = (e + 1) % @as(u32, experts);
             used[e] = true;
             slots[r * topk + k] = e;
             scores[r * topk + k] = 0.5;
@@ -105,8 +105,19 @@ test "mlx_exl3_moe returns the right shape and dtype" {
     const scores_bytes = std.mem.sliceAsBytes(&scores);
 
     const shape_x = [_]c_int{ @intCast(rows), @intCast(hidden) };
-    const shape_bank_gu = [_]c_int{ @intCast(experts), @intCast(tiles_gu * packed_n) };
-    const shape_bank_d = [_]c_int{ @intCast(experts), @intCast(tiles_d * packed_n) };
+    // Sushi bank layout: [E, in/16, out/16, packed] per projection.
+    const shape_bank_gu = [_]c_int{
+        @intCast(experts),
+        @intCast(hidden / 16),
+        @intCast(inter / 16),
+        @intCast(packed_n),
+    };
+    const shape_bank_d = [_]c_int{
+        @intCast(experts),
+        @intCast(inter / 16),
+        @intCast(hidden / 16),
+        @intCast(packed_n),
+    };
     const shape_hidden = [_]c_int{@intCast(hidden)};
     const shape_inter = [_]c_int{@intCast(inter)};
     const shape_slots = [_]c_int{ @intCast(rows), @intCast(topk) };
@@ -141,7 +152,7 @@ test "mlx_exl3_moe returns the right shape and dtype" {
     const stream = mlx.mlx_stream_new_device(dev);
 
     var res = mlx.mlx_array{};
-    const rc = mlx.mlx_exl3_moe(
+    const rc = mlx.mlx_fast_exl3_moe(
         &res,
         xa,
         gta,
@@ -172,6 +183,54 @@ test "mlx_exl3_moe returns the right shape and dtype" {
 
     _ = mlx.mlx_array_eval(res);
     const out = mlx_array_data_float32(res).?;
+
+    // Reference-decode isolation first: the C decode ABI against the
+    // in-tree Zig reference on expert 0. Catches any reference-decoder
+    // drift separately from the composed MoE plumbing.
+    {
+        const w_ref = try alloc.alloc(u16, hidden * inter);
+        defer alloc.free(w_ref);
+        try exl3.reconstructPublic(
+            alloc,
+            gbuf[0 .. tiles_gu * packed_n],
+            &suh_g,
+            &svh_g,
+            hidden,
+            inter,
+            rate,
+            dec,
+            w_ref,
+        );
+        var dec_res = mlx.mlx_array{};
+        const flat_shape = [_]c_int{@intCast(tiles_gu * packed_n)};
+        const gt0 = arrayNewData(g_bytes[0 .. tiles_gu * packed_n * 2], &flat_shape, .uint16);
+        defer _ = mlx_array_free(gt0);
+        const rc0 = mlx.mlx_fast_exl3_decode(
+            &dec_res,
+            gt0,
+            gsuh,
+            gsvh,
+            @intCast(hidden),
+            @intCast(inter),
+            @intCast(rate_n / 16),
+            window,
+            .float16,
+            stream,
+        );
+        try std.testing.expectEqual(@as(c_int, 0), rc0);
+        defer _ = mlx_array_free(dec_res);
+        try std.testing.expectEqual(@as(usize, 2), mlx.mlx_array_ndim(dec_res));
+        try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(dec_res));
+        _ = mlx.mlx_array_eval(dec_res);
+        const dec_bits: [*]const u16 = @ptrCast(mlx_array_data_float32(dec_res).?);
+        var dec_diffs: usize = 0;
+        for (0..hidden * inter) |i| {
+            const got = std.mem.readInt(u16, std.mem.asBytes(&dec_bits[i]), .little);
+            if (got != w_ref[i]) dec_diffs += 1;
+        }
+        std.debug.print("exl3_decode expert0 vs zig reference: {d} bit diffs\n", .{dec_diffs});
+        try std.testing.expectEqual(@as(usize, 0), dec_diffs);
+    }
 
     // Double-precision host reference: decode every expert with the
     // in-tree reference decoder (reconstructPublic writes f16 bits) and

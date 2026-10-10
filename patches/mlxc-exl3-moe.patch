@@ -9,85 +9,59 @@ runtime codeword-window config; the C ABI has no other channel for it.
 
 --- a/mlx/c/fast.h
 +++ b/mlx/c/fast.h
-@@ -98,6 +98,34 @@
-     float eps,
+@@ -99,6 +99,24 @@
      const mlx_stream s);
  
-+/**
-+ * Routed EXL3 MoE layer (sushi's moeSwigluClamped non-Metal route).
-+ * Decodes the packed trellis banks with the EXL3 reference decoder and
-+ * runs the routed clamped-SwiGLU MoE over the router slots; the gate
-+ * clamps above `limit`, the up branch clamps to [-limit, limit] and
-+ * `limit == 0` disables clamping. `window` is the pack's codeword
-+ * window width in bits (sushi's runtime window config).
+ /**
++ * EXL3 trellis tile decode: reconstruct one expert weight matrix
++ * [in_features, out_features] from its packed flat trellis plus the
++ * suh/svh scale bit patterns, bit-exact to sushi's expert_exl3.zig
++ * reconstructPublic.
 + */
-+int mlx_fast_exl3_moe(
++int mlx_fast_exl3_decode(
 +    mlx_array* res,
-+    const mlx_array x,
-+    const mlx_array gate_trellis,
-+    const mlx_array gate_suh,
-+    const mlx_array gate_svh,
-+    const mlx_array up_trellis,
-+    const mlx_array up_suh,
-+    const mlx_array up_svh,
-+    const mlx_array down_trellis,
-+    const mlx_array down_suh,
-+    const mlx_array down_svh,
-+    const mlx_array slots,
-+    const mlx_array scores,
-+    int topk,
++    const mlx_array trellis,
++    const mlx_array suh,
++    const mlx_array svh,
++    int in_features,
++    int out_features,
++    int bits,
 +    int window,
-+    float limit,
 +    mlx_dtype out_dtype,
 +    const mlx_stream s);
 +
- typedef struct mlx_fast_metal_kernel_config_ {
-   void* ctx;
- } mlx_fast_metal_kernel_config;
++/**
+  * Routed EXL3 MoE layer (sushi's moeSwigluClamped non-Metal route).
+  * Decodes the packed trellis banks with the EXL3 reference decoder and
+  * runs the routed clamped-SwiGLU MoE over the router slots; the gate
 --- a/mlx/c/fast.cpp
 +++ b/mlx/c/fast.cpp
-@@ -276,6 +276,53 @@
+@@ -276,6 +276,37 @@
    return 0;
  }
  
-+extern "C" int mlx_fast_exl3_moe(
++extern "C" int mlx_fast_exl3_decode(
 +    mlx_array* res,
-+    const mlx_array x,
-+    const mlx_array gate_trellis,
-+    const mlx_array gate_suh,
-+    const mlx_array gate_svh,
-+    const mlx_array up_trellis,
-+    const mlx_array up_suh,
-+    const mlx_array up_svh,
-+    const mlx_array down_trellis,
-+    const mlx_array down_suh,
-+    const mlx_array down_svh,
-+    const mlx_array slots,
-+    const mlx_array scores,
-+    int topk,
++    const mlx_array trellis,
++    const mlx_array suh,
++    const mlx_array svh,
++    int in_features,
++    int out_features,
++    int bits,
 +    int window,
-+    float limit,
 +    mlx_dtype out_dtype,
 +    const mlx_stream s) {
 +  try {
 +    mlx_array_set_(
 +        *res,
-+        mlx::core::fast::exl3_moe(
-+            mlx_array_get_(x),
-+            mlx_array_get_(gate_trellis),
-+            mlx_array_get_(gate_suh),
-+            mlx_array_get_(gate_svh),
-+            mlx_array_get_(up_trellis),
-+            mlx_array_get_(up_suh),
-+            mlx_array_get_(up_svh),
-+            mlx_array_get_(down_trellis),
-+            mlx_array_get_(down_suh),
-+            mlx_array_get_(down_svh),
-+            mlx_array_get_(slots),
-+            mlx_array_get_(scores),
-+            topk,
++        mlx::core::fast::exl3_decode(
++            mlx_array_get_(trellis),
++            mlx_array_get_(suh),
++            mlx_array_get_(svh),
++            in_features,
++            out_features,
++            bits,
 +            window,
-+            limit,
 +            mlx_dtype_to_cpp(out_dtype),
 +            mlx_stream_get_(s)));
 +  } catch (std::exception& e) {
@@ -97,6 +71,6 @@ runtime codeword-window config; the C ABI has no other channel for it.
 +  return 0;
 +}
 +
- struct mlx_fast_metal_kernel_config_cpp_ {
-   std::vector<mlx::core::Shape> output_shapes;
-   std::vector<mlx::core::Dtype> output_dtypes;
+ extern "C" int mlx_fast_exl3_moe(
+     mlx_array* res,
+     const mlx_array x,

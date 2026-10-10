@@ -286,11 +286,15 @@ pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, sc
 // MoE expert dispatch. No transpose flag: `b` must already be [..., in, out].
 pub extern "c" fn mlx_gather_mm(res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) c_int;
 
+// EXL3 trellis tile decode (mlxc-exl3-moe patch). Bit-exact to
+// expert_exl3.zig reconstructPublic.
+pub extern "c" fn mlx_fast_exl3_decode(res: *mlx_array, trellis: mlx_array, suh: mlx_array, svh: mlx_array, in_features: c_int, out_features: c_int, bits: c_int, window: c_int, out_dtype: mlx_dtype, s: mlx_stream) c_int;
+
 // Routed EXL3 MoE (sushi moeSwigluClamped non-Metal route; mlxc-exl3-moe
 // patch). Decodes the packed trellis banks and runs the clamped-SwiGLU
 // routed MoE; `window` is the pack's codeword window width in bits and
 // `limit == 0` disables the SwiGLU clamp.
-pub extern "c" fn mlx_exl3_moe(res: *mlx_array, x: mlx_array, gate_trellis: mlx_array, gate_suh: mlx_array, gate_svh: mlx_array, up_trellis: mlx_array, up_suh: mlx_array, up_svh: mlx_array, down_trellis: mlx_array, down_suh: mlx_array, down_svh: mlx_array, slots: mlx_array, scores: mlx_array, topk: c_int, window: c_int, limit: f32, out_dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_exl3_moe(res: *mlx_array, x: mlx_array, gate_trellis: mlx_array, gate_suh: mlx_array, gate_svh: mlx_array, up_trellis: mlx_array, up_suh: mlx_array, up_svh: mlx_array, down_trellis: mlx_array, down_suh: mlx_array, down_svh: mlx_array, slots: mlx_array, scores: mlx_array, topk: c_int, window: c_int, limit: f32, out_dtype: mlx_dtype, s: mlx_stream) c_int;
 
 // Dequantize (fallback)
 pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
