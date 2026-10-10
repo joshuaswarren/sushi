@@ -123,9 +123,14 @@ int main(int argc, char **argv) {
     vkEnumeratePhysicalDevices(inst, &nd, pds);
     VkPhysicalDevice pd = pds[0];
     VkPhysicalDeviceProperties pp;
+    /* EXL3_VK_DEVICE=<substring> picks another device (for example the Honeykrisp ICD on an Apple Silicon Mac).
+     * Default: the software device (lavapipe/llvmpipe), so the oracle runs without a GPU. */
+    const char *want = getenv("EXL3_VK_DEVICE");
     for (uint32_t i = 0; i < nd; i++) {
         vkGetPhysicalDeviceProperties(pds[i], &pp);
-        if (strstr(pp.deviceName, "llvmpipe") || strstr(pp.deviceName, "lavapipe")) { pd = pds[i]; break; }
+        int hit = want ? strstr(pp.deviceName, want) != NULL
+                       : (strstr(pp.deviceName, "llvmpipe") || strstr(pp.deviceName, "lavapipe"));
+        if (hit) { pd = pds[i]; break; }
     }
     vkGetPhysicalDeviceProperties(pd, &pp);
     printf("device            : %s (vulkan %u.%u)\n", pp.deviceName,
