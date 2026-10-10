@@ -1,4 +1,9 @@
 oracle.bin
+oracle_moe.bin
+oracle_moe.bin.dense
 *.spv
 harness
 gen_oracle
+gen_moe
+gen_moe_quick
+gemv_check
