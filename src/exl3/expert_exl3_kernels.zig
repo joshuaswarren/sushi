@@ -3063,6 +3063,7 @@ fn plainMoeFused(
     limit: c_int,
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
+    const t_start = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .boot);
     const xsh = mlx.getShape(x);
     const ssh = mlx.getShape(slots_u);
     const rows: c_int = if (xsh.len == 1) 1 else xsh[0];
@@ -3324,6 +3325,21 @@ fn plainMoeFused(
     for (workers) |*w| if (w.err == 1) return error.SlotOutOfRange;
     for (workers) |*w| if (w.err == 2) return error.Exl3DecodeFailed;
 
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const ms = @divTrunc(t_start.untilNow(io, .boot).nanoseconds, 1_000_000);
+        var distinct: usize = 0;
+        if (alloc.alloc(bool, E)) |seen| {
+            @memset(seen, false);
+            for (slots_slice) |sl| {
+                if (sl < E and !seen[sl]) {
+                    seen[sl] = true;
+                    distinct += 1;
+                }
+            }
+        } else |_| {}
+        log.info("[exl3-plain] rows={d} slots={d} distinct_experts={d} {d} ms\n", .{ rows, nslots, distinct, ms });
+    }
     const out_count: usize = @intCast(rows * hidden);
     // The buffer has to outlive the returned MLX array, and the C destructor
     // MLX will call cannot see the arena allocator. Hand the buffer (and a
