@@ -156,7 +156,7 @@ void main() {
     for (uint e = lid; e < 16384u; e += 256u) {
         uint r = e >> 7;
         uint c = e & 127u;
-        float acc = 0.0;
+        precise float acc = 0.0;
         for (uint k = 0u; k < 128u; k++) {
             float he = (bitCount(r & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
             acc = acc + he * f16ToF32(g_dec16[blockBase + k * 128u + c]);
@@ -170,7 +170,7 @@ void main() {
     for (uint e = lid; e < 16384u; e += 256u) {
         uint r = e >> 7;
         uint c = e & 127u;
-        float acc = 0.0;
+        precise float acc = 0.0;
         for (uint k = 0u; k < 128u; k++) {
             float he = (bitCount(c & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
             acc = acc + he * g_tmp[blockBase + r * 128u + k];
