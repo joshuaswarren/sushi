@@ -1,0 +1,123 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// probe.comp — denormal / rounding / contraction discriminator for the
+// EXL3 decode float stages. One invocation computes fixed scalar edge cases
+// and one real Hadamard column (probe_col.h, generated from oracle.bin)
+// twice: with separate mul+add (what the oracle and lavapipe do) and with
+// explicit fma() (what a contracting driver computes). A driver that fuses
+// `acc + he*x` silently produces the fma variant for the separate-op code.
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) writeonly buffer Out { uint g_out[]; };
+
+#include "probe_col.h"
+const float PB_SUH = uintBitsToFloat(PB_SUH_BITS);
+const uint COL[128] = uint[128](COL_RAW);
+
+const float HAD_SCALE = 0.08838834764831845;
+
+float f16ToF32(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    uint bits;
+    if (exp == 0u) {
+        if (man == 0u) bits = sign << 31;
+        else {
+            uint m = man; uint s = 0u;
+            while ((m & 0x200u) == 0u) { m <<= 1; s++; }
+            bits = (sign << 31) | ((112u - s) << 23) | ((m & 0x1FFu) << 14);
+        }
+    } else if (exp == 0x1Fu) bits = (sign << 31) | (0xFFu << 23) | (man << 13);
+    else bits = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+    return uintBitsToFloat(bits);
+}
+
+uint f32ToF16(float v) {
+    uint b = floatBitsToUint(v);
+    uint sign = (b >> 16) & 0x8000u;
+    uint exp = (b >> 23) & 0xFFu;
+    uint man = b & 0x7FFFFFu;
+    if (exp == 0xFFu) return sign | 0x7C00u | (man != 0u ? 0x0200u : 0u);
+    int ne = int(exp) - 127 + 15;
+    if (ne >= 31) return sign | 0x7C00u;
+    if (ne <= 0) {
+        if (ne < -10) return sign;
+        uint m = man | 0x800000u;
+        uint shift = uint(14 - ne);
+        uint rem = m & ((1u << shift) - 1u);
+        uint h16 = m >> shift;
+        uint halfUlp = 1u << (shift - 1u);
+        if (rem > halfUlp || (rem == halfUlp && (h16 & 1u) == 1u)) h16++;
+        return sign | h16;
+    }
+    uint h16 = (uint(ne) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && ((man >> 13) & 1u) == 1u)) h16++;
+    if (h16 >= 0x7C00u) return sign | 0x7C00u;
+    return sign | h16;
+}
+
+uint f32ToBf16(uint b) {
+    uint lsb = (b >> 16) & 1u;
+    return (b + 0x7FFFu + lsb) >> 16;
+}
+
+void main() {
+    float minDen = uintBitsToFloat(0x00000001u); // f32 min subnormal 1.4e-45
+    float tiny = uintBitsToFloat(0x00400000u);   // 2^-120, normal
+    float a = uintBitsToFloat(0x3F800001u);      // 1 + 2^-23
+    float b3 = uintBitsToFloat(0x3F800003u);     // 1 + 3*2^-23
+    float p4 = uintBitsToFloat(0x3F800004u);     // round(a*b3) = 1 + 2^-21
+    float c = -p4;
+
+    // 0-3: does the device keep f32 denormals through storage, add, mul, fma?
+    g_out[0] = floatBitsToUint(minDen);
+    g_out[1] = floatBitsToUint(minDen + minDen);
+    g_out[2] = floatBitsToUint(minDen * 2.0);
+    g_out[3] = floatBitsToUint(fma(minDen, 2.0, 0.0));
+    // 4-7: denormal ladder with a normal-scale start (2^-120 steps)
+    float l = tiny;
+    l = l + tiny; g_out[4] = floatBitsToUint(l);
+    l = l * 0.25; g_out[5] = floatBitsToUint(l);          // 2^-119.5-ish steps toward subnormal
+    l = l * 0.25; g_out[6] = floatBitsToUint(l);
+    l = l * 0.25; g_out[7] = floatBitsToUint(l);          // first result below 2^-126 on step 3
+    // 8: contraction discriminator: a*b3 rounds to p4, so separate (a*b3)+c
+    // is exactly +0.0; true single-rounding keeps the 3*2^-46 tail.
+    g_out[8] = floatBitsToUint(a * b3 + c);
+    // 9: same expression as an explicit fma for comparison.
+    g_out[9] = floatBitsToUint(fma(a, b3, c));
+    // 10: signed zero: (x - x) * -1 -> -0.0 (0x80000000) unless flushed/rewritten.
+    float z = 1.0;
+    g_out[10] = floatBitsToUint((z - z) * -1.0);
+    // 11-14: f32->f16 RNE boundaries (integer math, must match everywhere).
+    g_out[11] = f32ToF16(uintBitsToFloat(0x3F801000u)); // rem==halfUlp, lsb 0 -> 0x3C00
+    g_out[12] = f32ToF16(uintBitsToFloat(0x3F801001u)); // rem>halfUlp -> 0x3C01
+    g_out[13] = f32ToF16(uintBitsToFloat(0x33800000u)); // 2^-24, f16 min subnormal -> 0x0001
+    g_out[14] = f32ToF16(uintBitsToFloat(0x337FFFFFu)); // just below -> 0x0001 (RNE half even)
+    // 15-17: f32->bf16 boundaries.
+    g_out[15] = f32ToBf16(0x3F7FFFFFu); // max < 1.0 -> rounds UP to 0x3F80
+    g_out[16] = f32ToBf16(0x7F7FFFFFu); // max finite -> 0x7F800000 (inf)
+    g_out[17] = f32ToBf16(0x3F807FFFu); // mid boundary, lsb 0 -> stays 0x3F80
+    // 18: HAD_SCALE * f16 min subnormal (5.27e-9, normal f32).
+    g_out[18] = floatBitsToUint(HAD_SCALE * f16ToF32(0x0001u));
+    // 19-21: the real-data Hadamard column, separate ops (oracle order).
+    float accS = 0.0;
+    for (uint k = 0u; k < 128u; k++) {
+        float he = (bitCount(PB_ROW & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+        accS = accS + he * f16ToF32(uint(COL[k]));
+    }
+    g_out[19] = floatBitsToUint(accS);
+    // 20: same column, explicit fma — what a contracting driver really computes.
+    float accF = 0.0;
+    for (uint k = 0u; k < 128u; k++) {
+        float he = (bitCount(PB_ROW & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+        accF = fma(he, f16ToF32(uint(COL[k])), accF);
+    }
+    g_out[20] = floatBitsToUint(accF);
+    // 21: separate-op sum after suh-scale via the same column's suh (oracle
+    // pair for the maxRel class; suh value folded here as a literal).
+    g_out[21] = floatBitsToUint(PB_SUH * accS);
+    // 22: fma sum after suh-scale: the exact maxRel-1.5e25 signature the
+    // device run reported for rowH128.
+    g_out[22] = floatBitsToUint(PB_SUH * accF);
+}
