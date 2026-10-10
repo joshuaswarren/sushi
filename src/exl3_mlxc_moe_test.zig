@@ -184,6 +184,8 @@ test "mlx_fast_exl3_moe returns the right shape and dtype" {
     _ = mlx.mlx_array_eval(res);
     const out = mlx_array_data_float32(res).?;
 
+    const dec = exl3.Decode{ .codebook = .mcg, .window = .w15 };
+    const rate = exl3.Rate{ .n = rate_n };
     // Reference-decode isolation first: the C decode ABI against the
     // in-tree Zig reference on expert 0. Catches any reference-decoder
     // drift separately from the composed MoE plumbing.
@@ -229,6 +231,7 @@ test "mlx_fast_exl3_moe returns the right shape and dtype" {
             if (got != w_ref[i]) dec_diffs += 1;
         }
         std.debug.print("exl3_decode expert0 vs zig reference: {d} bit diffs\n", .{dec_diffs});
+        // First-element dump on failure: c++=b2c1.. zig=3bfa.. (2026-10-10 run).
         try std.testing.expectEqual(@as(usize, 0), dec_diffs);
     }
 
@@ -237,8 +240,6 @@ test "mlx_fast_exl3_moe returns the right shape and dtype" {
     // run the same clamped routed MoE in f64. The kernel-level gates live
     // in the omarchy-mlx doctest; this pins the C ABI composition end to
     // end.
-    const dec = exl3.Decode{ .codebook = .mcg, .window = .w15 };
-    const rate = exl3.Rate{ .n = rate_n };
     const w = try alloc.alloc(u16, hidden * inter);
     defer alloc.free(w);
     const wu = try alloc.alloc(u16, hidden * inter);
