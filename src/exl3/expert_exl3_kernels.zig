@@ -3075,6 +3075,7 @@ fn plainMoeFused(
     if (x_size > 32 * 1024 * 1024) return error.BadExl3Shape;
 
     try mlx.check(mlx.mlx_array_eval(slots_u));
+    if (mlx.mlx_array_dtype(slots_u) != .uint32 and mlx.mlx_array_dtype(slots_u) != .int32) return error.UnreadableExl3Output;
     const slots_ptr = mlx.mlx_array_data_uint32(slots_u) orelse return error.UnreadableExl3Output;
     const slots_heap = try alloc.alloc(u32, @intCast(nslots));
     defer alloc.free(slots_heap);
@@ -3085,13 +3086,24 @@ fn plainMoeFused(
     try mlx.check(mlx.mlx_array_eval(x));
     const xf = try alloc.alloc(f32, x_size);
     defer alloc.free(xf);
-    if (mlx.mlx_array_data_float32(x)) |p| {
-        @memcpy(xf, p[0..x_size]);
-    } else if (mlx.mlx_array_data_float16(x)) |p| {
-        for (p[0..x_size], 0..) |v, i| xf[i] = @floatCast(v);
-    } else if (mlx.mlx_array_data_bfloat16(x)) |p| {
-        for (p[0..x_size], 0..) |v, i| xf[i] = @bitCast(@as(u32, v) << 16);
-    } else return error.F32Unreadable;
+    // mlx-c data_<T>() does NOT check the dtype: it returns a pointer for any array. Branch on the real dtype, or a
+    // bf16 x is read as f32 (wrong values, 2x over-read, SIGSEGV at the end of a mapping).
+    switch (mlx.mlx_array_dtype(x)) {
+        .float32 => @memcpy(xf, (mlx.mlx_array_data_float32(x) orelse return error.F32Unreadable)[0..x_size]),
+        .float16 => for ((mlx.mlx_array_data_float16(x) orelse return error.F32Unreadable)[0..x_size], 0..) |v, i| {
+            xf[i] = @floatCast(v);
+        },
+        .bfloat16 => for ((mlx.mlx_array_data_bfloat16(x) orelse return error.F32Unreadable)[0..x_size], 0..) |v, i| {
+            xf[i] = @bitCast(@as(u32, v) << 16);
+        },
+        else => return error.F32Unreadable,
+    }
+    for ([_]mlx.mlx_array{ gate_t, up_t, down_t }) |t| {
+        if (mlx.mlx_array_dtype(t) != .uint16) return error.UnreadableExl3Output;
+    }
+    for ([_]mlx.mlx_array{ gate_suh, gate_svh, up_suh, up_svh, down_suh, down_svh }) |v| {
+        if (mlx.mlx_array_dtype(v) != .float16) return error.UnreadableExl3Output;
+    }
 
     const gt = mlx.getShape(gate_t);
     const E: usize = @intCast(gt[0]);
@@ -3129,13 +3141,16 @@ fn plainMoeFused(
     const sc_count: usize = @intCast(nslots);
     const score_f = try alloc.alloc(f32, sc_count);
     defer alloc.free(score_f);
-    if (mlx.mlx_array_data_float32(scores)) |p| {
-        @memcpy(score_f, p[0..sc_count]);
-    } else if (mlx.mlx_array_data_float16(scores)) |p| {
-        for (p[0..sc_count], 0..) |v, i| score_f[i] = @floatCast(v);
-    } else if (mlx.mlx_array_data_bfloat16(scores)) |p| {
-        for (p[0..sc_count], 0..) |v, i| score_f[i] = @bitCast(@as(u32, v) << 16);
-    } else return error.F32Unreadable;
+    switch (mlx.mlx_array_dtype(scores)) {
+        .float32 => @memcpy(score_f, (mlx.mlx_array_data_float32(scores) orelse return error.F32Unreadable)[0..sc_count]),
+        .float16 => for ((mlx.mlx_array_data_float16(scores) orelse return error.F32Unreadable)[0..sc_count], 0..) |v, i| {
+            score_f[i] = @floatCast(v);
+        },
+        .bfloat16 => for ((mlx.mlx_array_data_bfloat16(scores) orelse return error.F32Unreadable)[0..sc_count], 0..) |v, i| {
+            score_f[i] = @bitCast(@as(u32, v) << 16);
+        },
+        else => return error.F32Unreadable,
+    }
 
     const tstride_gu: usize = @as(usize, @intCast(gt[1])) * @as(usize, @intCast(gt[2])) * rate.halfwords();
 
@@ -3314,8 +3329,19 @@ fn plainMoeFused(
     // MLX will call cannot see the arena allocator. Hand the buffer (and a
     // payload describing its size) to MLX with a destructor that frees both
     // via the page allocator — the only allocator reachable from the C ABI.
+    // The output bits must match the dtype the array is labeled with. Earlier code always wrote f16 bits, so a
+    // bf16 model got float16 bit patterns read as bfloat16.
+    if (out_dtype != .float16 and out_dtype != .bfloat16) return error.UnreadableExl3Output;
+    const Conv = struct {
+        // Round to nearest even; NaN stays a quiet NaN.
+        fn bf16(v: f32) u16 {
+            if (v != v) return 0x7fc0;
+            const b: u32 = @bitCast(v);
+            return @intCast((b +% 0x7fff +% ((b >> 16) & 1)) >> 16);
+        }
+    };
     const out_bits = try std.heap.page_allocator.alloc(u16, out_count);
-    for (acc_f, out_bits) |v, *b| b.* = exl3.f32ToF16Bits(v);
+    for (acc_f, out_bits) |v, *b| b.* = if (out_dtype == .bfloat16) Conv.bf16(v) else exl3.f32ToF16Bits(v);
     const out_shape: [2]c_int = .{ rows, hidden };
     _ = s;
     const Payload = struct { ptr: [*]align(2) u16, count: usize };
