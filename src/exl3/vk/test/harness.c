@@ -489,6 +489,14 @@ static int runMoeStage(VkDevice dev, VkPhysicalDevice pd, VkQueue queue, uint32_
                 }
                 printf("  slot %zu (e=%u): ag exact %zu/%zu firstBad %zu second %zu\n",
                        sl, ((uint32_t *)bufs[18].ptr)[sl], ex, inter, first, second);
+                if (first < inter) {
+                    printf("    first bad got/want (f16 bits):");
+                    for (size_t o = first, shown = 0; o < inter && shown < 6; o++) {
+                        uint32_t g = agG[sl * inter + o], w = rd16(mb + C.off_ag + 2 * (sl * inter + o));
+                        if (g != w) { printf(" [%zu] %04X/%04X", o, g, w); shown++; }
+                    }
+                    printf("\n");
+                }
                 if (sl == 0) {
                     printf("    per-tile exact:");
                     for (size_t tn = 0; tn < inter / 16; tn++) {
