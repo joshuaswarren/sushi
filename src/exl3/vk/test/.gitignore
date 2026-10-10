@@ -1,0 +1,4 @@
+oracle.bin
+*.spv
+harness
+gen_oracle

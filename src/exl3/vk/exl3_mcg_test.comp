@@ -1,0 +1,68 @@
+#version 460
+// All 65536 codewords through decodeMcg, same code as exl3_decode.comp.
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) writeonly buffer Out { uint g_out[]; };
+
+const uint MCG_MULT = 0xCBAC1FEDu;
+
+float f16ToF32(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    uint bits;
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign << 31;
+        } else {
+            uint m = man;
+            uint s = 0u;
+            while ((m & 0x200u) == 0u) { m <<= 1; s++; }
+            bits = (sign << 31) | ((112u - s) << 23) | ((m & 0x1FFu) << 14);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31) | (0xFFu << 23) | (man << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+uint f32ToF16(float v) {
+    uint b = floatBitsToUint(v);
+    uint sign = (b >> 16) & 0x8000u;
+    uint exp = (b >> 23) & 0xFFu;
+    uint man = b & 0x7FFFFFu;
+    if (exp == 0xFFu) {
+        return sign | 0x7C00u | (man != 0u ? 0x0200u : 0u);
+    }
+    int ne = int(exp) - 127 + 15;
+    if (ne >= 31) return sign | 0x7C00u;
+    if (ne <= 0) {
+        if (ne < -10) return sign;
+        uint m = man | 0x800000u;
+        uint shift = uint(14 - ne);
+        uint rem = m & ((1u << shift) - 1u);
+        uint h16 = m >> shift;
+        uint halfUlp = 1u << (shift - 1u);
+        if (rem > halfUlp || (rem == halfUlp && (h16 & 1u) == 1u)) h16++;
+        return sign | h16;
+    }
+    uint h16 = (uint(ne) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && ((man >> 13) & 1u) == 1u)) h16++;
+    if (h16 >= 0x7C00u) return sign | 0x7C00u;
+    return sign | h16;
+}
+
+uint decodeMcg(uint cw) {
+    uint mixed = cw * MCG_MULT;
+    uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
+    float lo = f16ToF32(pair & 0xFFFFu);
+    float hi = f16ToF32(pair >> 16);
+    return f32ToF16(lo + hi);
+}
+
+void main() {
+    uint cw = gl_GlobalInvocationID.x;
+    if (cw < 65536u) g_out[cw] = decodeMcg(cw);
+}

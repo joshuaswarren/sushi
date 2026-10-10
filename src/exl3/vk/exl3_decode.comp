@@ -1,0 +1,184 @@
+#version 460
+// EXL3 trellis tile decode, Vulkan compute (M1 oracle build).
+// Mirrors sushi src/exl3/expert_exl3.zig: unpackTile (:177), decodeMcg (:141),
+// tensorCorePerm (:226), H128 (:240), suh/svh scaling as in reconstructPublic (:287).
+// One workgroup (256 invocations) decodes one 128x128 block = 8x8 tiles of 16x16
+// weights, applies the row H128, suh, the column H128, svh, and emits f32, f16 and
+// bf16 bit patterns. Integer and bit-exact parts use integer ops only; the only
+// float ops are the f32 add/mul chain the reference performs, in the same order.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Trellis { uint g_trellis[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Suh { uint g_suh[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Svh { uint g_svh[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Dec16 { uint g_dec16[]; };
+layout(std430, set = 0, binding = 4) buffer Tmp { float g_tmp[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer OutF32 { float g_out32[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer OutF16 { uint g_out16[]; };
+layout(std430, set = 0, binding = 7) writeonly buffer OutBf16 { uint g_outbf[]; };
+
+layout(push_constant) uniform PC {
+    uint n;    // packed halfwords per tile (rate.n, 32 for K=2)
+    uint mask; // codeword window mask (0x7FFF for window 15)
+} pc;
+
+const float HAD_SCALE = 0.08838834764831845;
+const uint MCG_MULT = 0xCBAC1FEDu;
+
+// f16 bit pattern -> f32, exact (integer widen, no driver rounding).
+float f16ToF32(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    uint bits;
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign << 31;
+        } else {
+            // Normalize: value = man * 2^-24; after the loop m has its MSB at
+            // bit 9, s shifts consumed, exponent = 112 - s.
+            uint m = man;
+            uint s = 0u;
+            while ((m & 0x200u) == 0u) { m <<= 1; s++; }
+            bits = (sign << 31) | ((112u - s) << 23) | ((m & 0x1FFu) << 14);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31) | (0xFFu << 23) | (man << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+// f32 -> f16 bit pattern, round-to-nearest-even (matches Zig @floatCast f32->f16).
+uint f32ToF16(float v) {
+    uint b = floatBitsToUint(v);
+    uint sign = (b >> 16) & 0x8000u;
+    uint exp = (b >> 23) & 0xFFu;
+    uint man = b & 0x7FFFFFu;
+    if (exp == 0xFFu) {
+        // No NaN-generating op exists on the tested paths; canonicalize anyway.
+        return sign | 0x7C00u | (man != 0u ? 0x0200u : 0u);
+    }
+    int ne = int(exp) - 127 + 15;
+    if (ne >= 31) return sign | 0x7C00u;
+    if (ne <= 0) {
+        if (ne < -10) return sign;
+        uint m = man | 0x800000u;
+        uint shift = uint(14 - ne); // 14..23
+        uint rem = m & ((1u << shift) - 1u);
+        uint h16 = m >> shift;
+        uint halfUlp = 1u << (shift - 1u);
+        if (rem > halfUlp || (rem == halfUlp && (h16 & 1u) == 1u)) h16++;
+        return sign | h16;
+    }
+    uint h16 = (uint(ne) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && ((man >> 13) & 1u) == 1u)) h16++;
+    if (h16 >= 0x7C00u) return sign | 0x7C00u;
+    return sign | h16;
+}
+
+// f32 bits -> bf16 bits, round-to-nearest-even.
+uint f32ToBf16(uint b) {
+    uint lsb = (b >> 16) & 1u;
+    return (b + 0x7FFFu + lsb) >> 16;
+}
+
+// expert_exl3.zig decodeMcg: u32 mul + XOR, then an f32 add of the two f16 halves,
+// rounded to f16. The add is IEEE f32 on both sides; the round is integer RNE.
+uint decodeMcg(uint cw) {
+    uint mixed = cw * MCG_MULT;
+    uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
+    float lo = f16ToF32(pair & 0xFFFFu);
+    float hi = f16ToF32(pair >> 16);
+    return f32ToF16(lo + hi);
+}
+
+// tensorCorePerm entry i (i in 0..255).
+uint permOf(uint i) {
+    uint thread = i >> 3;
+    uint j = i & 7u;
+    uint row0 = (thread & 3u) << 1;
+    uint col0 = thread >> 2;
+    uint col1 = col0 + 8u;
+    uint rows[4] = uint[4](row0, row0 + 1u, row0 + 8u, row0 + 9u);
+    uint col = (j < 4u) ? col0 : col1;
+    return rows[j & 3u] * 16u + col;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint blockBase = block * 16384u;
+
+    // Stage A: threads 0..63 decode tile = 16x16 weights into Dec16 (f16 bits),
+    // laid out row-major over the 128x128 block (reconstructInner layout).
+    if (lid < 64u) {
+        uint wc = pc.n >> 1;      // u32 words per tile
+        uint total = pc.n << 4;   // bits per tile
+        uint tk = lid >> 3;       // in-tile index (rows)
+        uint tn = lid & 7u;       // out-tile index (cols)
+        uint tileBase = (block * 64u + lid) * wc;
+        for (uint t = 0u; t < 128u; t++) {
+            uint e0 = ((t * 2u + 1u) * pc.n) >> 4;
+            uint e1 = ((t * 2u + 2u) * pc.n) >> 4;
+            uint bit0 = e0 + total - 16u; // tail-biting pair window start
+            uint bit2 = e1 + total;
+            uint i0 = bit0 >> 5;
+            uint i1 = (bit2 - 1u) >> 5;
+            uint shift = (i1 + 1u) * 32u - bit2;
+            uint wa = g_trellis[tileBase + (i0 % wc)];
+            uint wb = g_trellis[tileBase + (i1 % wc)];
+            // Zig reference: funnel = low 32 bits of (wa<<32 | wb) >> shift,
+            // shift in [0,32]; expressed here with 32-bit ops only.
+            uint funnel = (shift == 0u) ? wb
+                        : (shift >= 32u) ? wa
+                        : ((wa << (32u - shift)) | (wb >> shift));
+            uint fresh = e1 - e0;
+            uint cwEven = ((funnel >> fresh) & 0xFFFFu) & pc.mask;
+            uint cwOdd = (funnel & 0xFFFFu) & pc.mask;
+            uint pEven = permOf(t * 2u);
+            uint pOdd = permOf(t * 2u + 1u);
+            // reconstructInner layout: block row = tk*16 + p/16,
+            // block col = tn*16 + p%16.
+            uint rowE = (tk * 16u + (pEven >> 4)) * 128u + tn * 16u + (pEven & 15u);
+            uint rowO = (tk * 16u + (pOdd >> 4)) * 128u + tn * 16u + (pOdd & 15u);
+            g_dec16[blockBase + rowE] = decodeMcg(cwEven);
+            g_dec16[blockBase + rowO] = decodeMcg(cwOdd);
+        }
+    }
+    barrier();
+    memoryBarrierBuffer();
+
+    // Stage B: row H128 then suh (reconstructPublic row stage), k ascending,
+    // the exact reference summation order.
+    for (uint e = lid; e < 16384u; e += 256u) {
+        uint r = e >> 7;
+        uint c = e & 127u;
+        float acc = 0.0;
+        for (uint k = 0u; k < 128u; k++) {
+            float he = (bitCount(r & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+            acc = acc + he * f16ToF32(g_dec16[blockBase + k * 128u + c]);
+        }
+        g_tmp[blockBase + e] = acc * f16ToF32(g_suh[block * 128u + r]);
+    }
+    barrier();
+    memoryBarrierBuffer();
+
+    // Stage C: column H128 then svh, then the f16/bf16 rounds.
+    for (uint e = lid; e < 16384u; e += 256u) {
+        uint r = e >> 7;
+        uint c = e & 127u;
+        float acc = 0.0;
+        for (uint k = 0u; k < 128u; k++) {
+            float he = (bitCount(c & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+            acc = acc + he * g_tmp[blockBase + r * 128u + k];
+        }
+        float v = acc * f16ToF32(g_svh[block * 128u + c]);
+        uint b = floatBitsToUint(v);
+        g_out32[blockBase + e] = v;
+        g_out16[blockBase + e] = f32ToF16(v);
+        g_outbf[blockBase + e] = f32ToBf16(b);
+    }
+}
