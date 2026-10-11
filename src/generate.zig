@@ -322,7 +322,14 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
         prefill_chunk_override
     else
         @min(prefill_chunk_override, pinned_chunk);
-    return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
+    const bounded = boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
+    const s = mlx.gpuStream();
+    // ponytail: fixed 512 default on non-Metal GPU streams; raise only when a device run proves it fits.
+    return defaultPrefillChunkForStream(bounded, !prefill_chunk_explicit and mlx.streamIsGpu(s) and !mlx.streamIsMetal(s));
+}
+
+fn defaultPrefillChunkForStream(width: usize, non_metal_gpu_default: bool) usize {
+    return if (non_metal_gpu_default) @min(width, PREFILL_CHUNK_FLOOR) else width;
 }
 
 /// The width a request forwards at, and the width its admission bills: `effectivePrefillChunk`,
@@ -22227,6 +22234,12 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
 
 pub fn decodeShareCapped(width: usize, cap: usize) usize {
     return if (cap == 0) width else @min(width, cap);
+}
+
+test "non-Metal stream default prefill width is capped at 512" {
+    try std.testing.expectEqual(@as(usize, 512), defaultPrefillChunkForStream(4096, true));
+    try std.testing.expectEqual(@as(usize, 256), defaultPrefillChunkForStream(256, true));
+    try std.testing.expectEqual(@as(usize, 4096), defaultPrefillChunkForStream(4096, false));
 }
 
 test "decodeShareCapped: the share cap narrows an explicit and an env width" {
