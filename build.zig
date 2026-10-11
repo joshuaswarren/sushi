@@ -216,6 +216,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
+
+    // exl3 tests only: they link the staged mlx-c and run without the
+    // fixtures the full unit-test artifact needs.
+    const test_exl3_step = b.step("test-exl3", "Run the exl3 tests");
+    test_exl3_step.dependOn(&b.addRunArtifact(exl3_tests).step);
 }
 
 fn addCHeaderModule(

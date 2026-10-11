@@ -322,3 +322,213 @@ test "mlx_fast_exl3_moe returns the right shape and dtype" {
     // or the wrong clamp side blows far past it.
     try std.testing.expect(max_abs < 1e-2);
 }
+
+test "mlx_fast_exl3_moe serves per-expert scale planes" {
+    // Sushi packs carry per-expert F16 scale planes [E, in] / [E, out]
+    // (root.zig Proj, the kld pack layout). The shared 1D case above
+    // cannot see a scale routed to the wrong expert, so this case gives
+    // every expert its own scale vector and compares against the f64
+    // chain, which decodes each expert with its own row.
+    const alloc = std.testing.allocator;
+    const hidden2 = 128;
+    const inter2 = 256;
+    const experts2 = 4;
+    const rows2 = 3;
+    const topk2 = 2;
+    const rate_n2 = 32;
+    const window2: c_int = 15;
+    const limit2: f32 = 7.0;
+
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+
+    const tiles_gu: usize = (hidden2 / 16) * (inter2 / 16);
+    const packed_n: usize = rate_n2;
+    const gbuf = try alloc.alloc(u16, experts2 * tiles_gu * packed_n);
+    defer alloc.free(gbuf);
+    const ubuf = try alloc.alloc(u16, experts2 * tiles_gu * packed_n);
+    defer alloc.free(ubuf);
+    const dbuf = try alloc.alloc(u16, experts2 * tiles_gu * packed_n);
+    defer alloc.free(dbuf);
+    for (gbuf) |*v| v.* = rand.int(u16);
+    for (ubuf) |*v| v.* = rand.int(u16);
+    for (dbuf) |*v| v.* = rand.int(u16);
+
+    // Per-expert planes: [E, hidden2] row scales and [E, inter2] column
+    // scales, positive normals 0.5..2 as raw f16 bits.
+    const suh_g = try alloc.alloc(u16, experts2 * hidden2);
+    defer alloc.free(suh_g);
+    const svh_g = try alloc.alloc(u16, experts2 * inter2);
+    defer alloc.free(svh_g);
+    const suh_u = try alloc.alloc(u16, experts2 * hidden2);
+    defer alloc.free(suh_u);
+    const svh_u = try alloc.alloc(u16, experts2 * inter2);
+    defer alloc.free(svh_u);
+    const suh_d = try alloc.alloc(u16, experts2 * inter2);
+    defer alloc.free(suh_d);
+    const svh_d = try alloc.alloc(u16, experts2 * hidden2);
+    defer alloc.free(svh_d);
+    for ([_][]u16{ suh_g, suh_u, svh_d }) |s| {
+        for (s) |*v| v.* = 0x3800 | (rand.int(u16) & 0x3FF);
+    }
+    for ([_][]u16{ svh_g, svh_u, suh_d }) |s| {
+        for (s) |*v| v.* = 0x3800 | (rand.int(u16) & 0x3FF);
+    }
+
+    var x: [rows2 * hidden2]f32 = undefined;
+    for (&x) |*v| v.* = @floatCast(rand.float(f64) * 4.0 - 2.0);
+    var slots: [rows2 * topk2]u32 = undefined;
+    var scores: [rows2 * topk2]f32 = undefined;
+    for (0..rows2) |r| {
+        var used: [experts2]bool = @splat(false);
+        for (0..topk2) |k| {
+            var e: u32 = rand.uintLessThan(u32, experts2);
+            while (used[e]) e = (e + 1) % @as(u32, experts2);
+            used[e] = true;
+            slots[r * topk2 + k] = e;
+            scores[r * topk2 + k] = 0.5;
+        }
+    }
+
+    const shape_x = [_]c_int{ @intCast(rows2), @intCast(hidden2) };
+    const shape_bank_gu = [_]c_int{ @intCast(experts2), @intCast(hidden2 / 16), @intCast(inter2 / 16), @intCast(packed_n) };
+    const shape_bank_d = [_]c_int{ @intCast(experts2), @intCast(inter2 / 16), @intCast(hidden2 / 16), @intCast(packed_n) };
+    const shape_suh = [_]c_int{ @intCast(experts2), @intCast(hidden2) };
+    const shape_svh = [_]c_int{ @intCast(experts2), @intCast(inter2) };
+    const shape_slots = [_]c_int{ @intCast(rows2), @intCast(topk2) };
+
+    const xa = arrayNewData(std.mem.sliceAsBytes(&x), &shape_x, .float32);
+    defer _ = mlx_array_free(xa);
+    const gta = arrayNewData(std.mem.sliceAsBytes(gbuf), &shape_bank_gu, .uint16);
+    defer _ = mlx_array_free(gta);
+    const uta = arrayNewData(std.mem.sliceAsBytes(ubuf), &shape_bank_gu, .uint16);
+    defer _ = mlx_array_free(uta);
+    const dta = arrayNewData(std.mem.sliceAsBytes(dbuf), &shape_bank_d, .uint16);
+    defer _ = mlx_array_free(dta);
+    const gsuh = arrayNewData(std.mem.sliceAsBytes(suh_g), &shape_suh, .float16);
+    defer _ = mlx_array_free(gsuh);
+    const gsvh = arrayNewData(std.mem.sliceAsBytes(svh_g), &shape_svh, .float16);
+    defer _ = mlx_array_free(gsvh);
+    const usuh = arrayNewData(std.mem.sliceAsBytes(suh_u), &shape_suh, .float16);
+    defer _ = mlx_array_free(usuh);
+    const usvh = arrayNewData(std.mem.sliceAsBytes(svh_u), &shape_svh, .float16);
+    defer _ = mlx_array_free(usvh);
+    const dsuh = arrayNewData(std.mem.sliceAsBytes(suh_d), &shape_svh, .float16);
+    defer _ = mlx_array_free(dsuh);
+    const dsvh = arrayNewData(std.mem.sliceAsBytes(svh_d), &shape_suh, .float16);
+    defer _ = mlx_array_free(dsvh);
+    const slots_a = arrayNewData(std.mem.sliceAsBytes(&slots), &shape_slots, .uint32);
+    defer _ = mlx_array_free(slots_a);
+    const scores_a = arrayNewData(std.mem.sliceAsBytes(&scores), &shape_slots, .float32);
+    defer _ = mlx_array_free(scores_a);
+
+    const dev = mlx.mlx_device_new_type(.cpu, 0);
+    const stream = mlx.mlx_stream_new_device(dev);
+
+    var res = mlx.mlx_array{};
+    const rc = mlx.mlx_fast_exl3_moe(
+        &res,
+        xa,
+        gta,
+        gsuh,
+        gsvh,
+        uta,
+        usuh,
+        usvh,
+        dta,
+        dsuh,
+        dsvh,
+        slots_a,
+        scores_a,
+        @intCast(topk2),
+        window2,
+        limit2,
+        .float32,
+        stream,
+    );
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer _ = mlx_array_free(res);
+    _ = mlx.mlx_array_eval(res);
+    const out = mlx_array_data_float32(res).?;
+
+    // f64 chain with per-expert scales: decode every expert with its own
+    // suh/svh rows2 and run the same clamped routed MoE.
+    const dec = exl3.Decode{ .codebook = .mcg, .window = .w15 };
+    const rate = exl3.Rate{ .n = rate_n2 };
+    const w = try alloc.alloc(u16, hidden2 * inter2);
+    defer alloc.free(w);
+    const wu = try alloc.alloc(u16, hidden2 * inter2);
+    defer alloc.free(wu);
+    const wd = try alloc.alloc(u16, inter2 * hidden2);
+    defer alloc.free(wd);
+    var acc: [rows2 * hidden2]f64 = @splat(0);
+    for (0..experts2) |e| {
+        try exl3.reconstructPublic(
+            alloc,
+            gbuf[e * tiles_gu * packed_n ..][0 .. tiles_gu * packed_n],
+            suh_g[e * hidden2 ..][0..hidden2],
+            svh_g[e * inter2 ..][0..inter2],
+            hidden2,
+            inter2,
+            rate,
+            dec,
+            w,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            ubuf[e * tiles_gu * packed_n ..][0 .. tiles_gu * packed_n],
+            suh_u[e * hidden2 ..][0..hidden2],
+            svh_u[e * inter2 ..][0..inter2],
+            hidden2,
+            inter2,
+            rate,
+            dec,
+            wu,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            dbuf[e * tiles_gu * packed_n ..][0 .. tiles_gu * packed_n],
+            suh_d[e * inter2 ..][0..inter2],
+            svh_d[e * hidden2 ..][0..hidden2],
+            inter2,
+            hidden2,
+            rate,
+            dec,
+            wd,
+        );
+        for (0..rows2) |r| {
+            for (0..topk2) |k| {
+                if (slots[r * topk2 + k] != e) continue;
+                var act: [inter2]f64 = undefined;
+                for (0..inter2) |j| {
+                    var h: f64 = 0;
+                    var u: f64 = 0;
+                    for (0..hidden2) |t| {
+                        const xv: f64 = x[r * hidden2 + t];
+                        h += xv * @as(f64, f16bits(w[t * inter2 + j]));
+                        u += xv * @as(f64, f16bits(wu[t * inter2 + j]));
+                    }
+                    if (h > limit2) h = limit2;
+                    if (u > limit2) u = limit2;
+                    if (u < -@as(f64, limit2)) u = -@as(f64, limit2);
+                    act[j] = (1.0 / (1.0 + @exp(-h))) * u;
+                }
+                for (0..hidden2) |o| {
+                    var d: f64 = 0;
+                    for (0..inter2) |t| {
+                        d += act[t] * @as(f64, f16bits(wd[t * hidden2 + o]));
+                    }
+                    acc[r * hidden2 + o] += @as(f64, scores[r * topk2 + k]) * d;
+                }
+            }
+        }
+    }
+
+    var max_abs: f64 = 0;
+    for (0..rows2 * hidden2) |i| {
+        const diff = @abs(@as(f64, out[i]) - acc[i]);
+        if (diff > max_abs) max_abs = diff;
+    }
+    std.debug.print("per-expert scale planes vs f64 reference: max_abs = {d:.6}\n", .{max_abs});
+    try std.testing.expect(max_abs < 1e-2);
+}
