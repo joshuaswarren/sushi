@@ -958,6 +958,18 @@ pub const Bf16NgramStore = struct {
 
 pub var slab_release_timeouts: std.atomic.Value(u64) = .init(0);
 
+/// Device-owned slabs are the default on a non-Metal GPU stream (Vulkan): the
+/// slab bytes are MLX allocator memory, written by the fill loop through the
+/// array's mapped pointer, so no host import (declined by Honeykrisp) and no
+/// copy is involved. `SUSHI_EXPERT_SLAB=host` restores the legacy mmap+import
+/// path; Metal and CPU streams always take it.
+fn deviceSlabsOn() bool {
+    const v = std.c.getenv("SUSHI_EXPERT_SLAB") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "host");
+}
+
+var device_slab_logged = std.atomic.Value(bool).init(false);
+
 const SlabOperand = struct {
     present: bool = false,
     slab: ?*io_mod.PageSlab = null,
@@ -970,15 +982,15 @@ const SlabOperand = struct {
         return .{ .stride = 0, .count = 0 };
     }
 
-    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32) !SlabOperand {
-        return createTyped(allocator, count, d0, d1, .bfloat16, 2);
+    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, s: mlx.mlx_stream) !SlabOperand {
+        return createTyped(allocator, count, d0, d1, .bfloat16, 2, s);
     }
 
-    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes, s);
     }
 
-    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -987,6 +999,21 @@ const SlabOperand = struct {
             if (d <= 0) return error.InvalidExpertGeometry;
             stride = try std.math.mul(usize, stride, @intCast(d));
             shape[j + 1] = d;
+        }
+        if (deviceSlabsOn() and mlx.streamIsGpu(s) and !mlx.streamIsMetal(s)) {
+            // Device-owned slab: the bytes ARE the backing array's mapped
+            // storage, so aliasing holds by construction and the imported
+            // (copied) fallback can never arise. `len` is the array's exact
+            // byte size: stride * count.
+            const slab = try io_mod.PageSlab.createDevice(allocator, stride * count, shape[0 .. inner.len + 1], dtype, s);
+            errdefer slab.destroy();
+            var handle = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(handle);
+            try mlx.check(mlx.mlx_array_set(&handle, slab.device.?.array));
+            if (!device_slab_logged.swap(true, .monotonic)) {
+                log.info("[expert-stream] device-owned expert slabs engaged (non-Metal GPU stream)\n", .{});
+            }
+            return .{ .present = true, .slab = slab, .payload = null, .array = handle, .stride = stride, .count = count };
         }
         const slab = try io_mod.PageSlab.create(allocator, stride * count);
         errdefer slab.destroy();
@@ -1004,22 +1031,26 @@ const SlabOperand = struct {
     fn destroy(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) void {
         if (!self.present) return;
         const slab = self.slab orelse return;
-        const payload = self.payload orelse return;
         _ = mlx.mlx_array_free(self.array);
-        var attempt: usize = 0;
-        while (payload.released.load(.acquire) == 0 and attempt < 32) : (attempt += 1) {
-            _ = mlx.mlx_synchronize(s);
-            _ = mlx.mlx_clear_cache();
-            std.Thread.yield() catch {};
+        if (self.payload) |payload| {
+            var attempt: usize = 0;
+            while (payload.released.load(.acquire) == 0 and attempt < 32) : (attempt += 1) {
+                _ = mlx.mlx_synchronize(s);
+                _ = mlx.mlx_clear_cache();
+                std.Thread.yield() catch {};
+            }
+            if (payload.released.load(.acquire) == 0) {
+                const timeouts = slab_release_timeouts.fetchAdd(1, .monotonic) + 1;
+                log.warn("[expert-stream] slab release timed out: {d} bytes stay mapped for MLX and are never freed (timeouts so far {d})\n", .{ slab.bytes.len, timeouts });
+                self.* = undefined;
+                return;
+            }
+            allocator.destroy(payload);
         }
-        if (payload.released.load(.acquire) == 0) {
-            const timeouts = slab_release_timeouts.fetchAdd(1, .monotonic) + 1;
-            log.warn("[expert-stream] slab release timed out: {d} bytes stay mapped for MLX and are never freed (timeouts so far {d})\n", .{ slab.bytes.len, timeouts });
-            self.* = undefined;
-            return;
-        }
+        // Device-owned slab: no host pages to unmap. slab.destroy() drops the
+        // backing array reference; MLX's allocator quarantines the device
+        // memory until in-flight submissions drain.
         slab.destroy();
-        allocator.destroy(payload);
         self.* = undefined;
     }
 
@@ -1224,11 +1255,11 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
-            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes, s)
         else if (spec.exl3)
-            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes, s)
         else
-            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
+            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes, s);
     }
     return slabs;
 }
@@ -3606,4 +3637,60 @@ test "GLM BF16 stream imports split expert slabs and preserves bytes across cach
         }
         if (group == 1) try t.expectEqual(@as(u64, 2), engine.fill_experts_total);
     }
+}
+
+test "device-owned slab fills are visible to the stream across a refill" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    // Device-owned slabs exist for the non-Metal GPU path (Vulkan); skip
+    // cleanly where there is no GPU stream or the GPU is Metal.
+    if (!mlx.streamIsGpu(s) or mlx.streamIsMetal(s)) return error.SkipZigTest;
+    var operand = try SlabOperand.createShaped(t.allocator, 4, &.{ 8, 2 }, .uint32, 4, s);
+    defer operand.destroy(t.allocator, s);
+    try t.expect(operand.present);
+    try t.expect(operand.slab.?.device != null);
+
+    // Aliasing by construction: the fill bytes are the array's own storage.
+    const data = mlx.mlx_array_data_uint32(operand.array).?;
+    try t.expectEqual(@intFromPtr(data), @intFromPtr(operand.slab.?.bytes.ptr));
+
+    const sumOf = struct {
+        fn call(arr: mlx.mlx_array, st: mlx.mlx_stream) !u32 {
+            var sum = mlx.mlx_array{ .ctx = null };
+            try mlx.check(mlx.mlx_sum(&sum, arr, false, st));
+            errdefer _ = mlx.mlx_array_free(sum);
+            if (mlx.mlx_array_eval(sum) != 0) return error.SlabDeviceEvalFailed;
+            _ = mlx.mlx_synchronize(st);
+            defer _ = mlx.mlx_array_free(sum);
+            return mlx.mlx_array_data_uint32(sum).?[0];
+        }
+    }.call;
+
+    // Generation 1: host fill through the slab pointer, GPU reads it back.
+    _ = try operand.slab.?.tryBeginFill();
+    const b1 = try operand.slab.?.writable();
+    const words1 = @as([*]align(4) u32, @alignCast(@ptrCast(b1.ptr)))[0 .. b1.len / 4];
+    var want1: u32 = 0;
+    var prng = std.Random.DefaultPrng.init(0x510);
+    const random = prng.random();
+    for (words1) |*w| {
+        w.* = random.uintLessThan(u32, 1000);
+        want1 += w.*;
+    }
+    _ = try operand.slab.?.publish();
+    try t.expectEqual(want1, try sumOf(operand.array, s));
+
+    // Generation 2: retire, refill the same memory, the stream must see the
+    // new bytes (the Metal no-copy contract, now on device-owned memory).
+    try operand.slab.?.retire();
+    _ = try operand.slab.?.tryBeginFill();
+    const b2 = try operand.slab.?.writable();
+    const words2 = @as([*]align(4) u32, @alignCast(@ptrCast(b2.ptr)))[0 .. b2.len / 4];
+    var want2: u32 = 0;
+    for (words2, 0..) |*w, i| {
+        w.* = @truncate(i *% 2654435761 +% 11);
+        want2 += w.*;
+    }
+    _ = try operand.slab.?.publish();
+    try t.expectEqual(want2, try sumOf(operand.array, s));
 }

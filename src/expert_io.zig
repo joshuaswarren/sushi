@@ -705,6 +705,10 @@ pub const Lease = struct {
     id: u64,
 };
 
+pub const DeviceBacking = struct {
+    array: mlx.mlx_array,
+};
+
 pub const PageSlab = struct {
     allocator: std.mem.Allocator,
     bytes: []align(align_bytes) u8,
@@ -714,6 +718,11 @@ pub const PageSlab = struct {
     live: std.ArrayList(u64) = .empty,
     mu: std.Io.Mutex = .init,
     cv: std.Io.Condition = .init,
+    /// Device-owned backing (non-Metal GPU streams): `bytes` aliases the mapped
+    /// host-visible data of `array`, memory owned by the MLX device allocator.
+    /// The fill loop writes the same pointer GPU dispatches read; no import and
+    /// no copy, and teardown goes through MLX's release/quarantine path.
+    device: ?DeviceBacking = null,
 
     pub fn create(allocator: std.mem.Allocator, len: usize) !*PageSlab {
         if (len == 0) return error.SlabEmpty;
@@ -734,8 +743,45 @@ pub const PageSlab = struct {
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
         self.live.deinit(allocator);
-        std.posix.munmap(self.bytes);
+        if (self.device) |dev| {
+            // Device-owned: drop the array reference; MLX's allocator release
+            // (with its submission-quarantine) frees the device memory. There
+            // are no host pages to unmap.
+            _ = mlx.mlx_array_free(dev.array);
+        } else {
+            std.posix.munmap(self.bytes);
+        }
         allocator.destroy(self);
+    }
+
+    /// Allocate the slab from the MLX device allocator on stream `s`: an
+    /// evaluated zeros array whose mapped data pointer becomes `bytes`. `len`
+    /// must equal the array's exact byte size (elements * itemsize); `shape`
+    /// is the operand shape, so the backing array doubles as the operand. Only
+    /// meaningful on a non-Metal GPU stream (Vulkan); the caller gates that.
+    pub fn createDevice(
+        allocator: std.mem.Allocator,
+        len: usize,
+        shape: []const c_int,
+        dtype: mlx.mlx_dtype,
+        s: mlx.mlx_stream,
+    ) !*PageSlab {
+        if (len == 0) return error.SlabEmpty;
+        var arr = mlx.mlx_array{ .ctx = null };
+        try mlx.check(mlx.mlx_zeros(&arr, shape.ptr, shape.len, dtype, s));
+        errdefer _ = mlx.mlx_array_free(arr);
+        if (mlx.mlx_array_eval(arr) != 0) return error.SlabDeviceEvalFailed;
+        _ = mlx.mlx_synchronize(s);
+        const raw = dataPointerOf(arr, dtype) orelse return error.SlabDeviceNoPointer;
+        if (@intFromPtr(raw) % pageSize() != 0) return error.SlabDeviceMisaligned;
+        const slab = try allocator.create(PageSlab);
+        errdefer allocator.destroy(slab);
+        slab.* = .{
+            .allocator = allocator,
+            .bytes = @as([*]align(align_bytes) u8, @alignCast(@ptrCast(@constCast(raw))))[0..len],
+            .device = .{ .array = arr },
+        };
+        return slab;
     }
 
     pub fn stateOf(self: *PageSlab) SlabState {
