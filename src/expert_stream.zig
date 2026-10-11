@@ -253,6 +253,7 @@ pub const Breakdown = struct {
     fill_ns: u64 = 0,
     compute_ns: u64 = 0,
     fill_bytes: u64 = 0,
+    copy_bytes: u64 = 0,
     hits: u64 = 0,
     union_members: u64 = 0,
     route_linear: RouteClass = .{},
@@ -958,6 +959,40 @@ pub const Bf16NgramStore = struct {
 
 pub var slab_release_timeouts: std.atomic.Value(u64) = .init(0);
 
+/// Slab imports on a non-Metal GPU stream cannot alias the host page slab
+/// (that zero copy is a Metal buffer property), so copy mode keeps the slab
+/// as the fill landing buffer and re-creates the device array from it after
+/// every fill, before the array is consumed. Default on for non-Metal GPU
+/// streams; SUSHI_EXPERT_IMPORT_COPY=0 restores the aliased-only refusal
+/// (ExpertSlabImportCopied). Metal and CPU streams always take the aliased
+/// managed import, unchanged.
+const ImportStreamKind = enum { metal, gpu_other, cpu };
+
+fn importStreamKind(s: mlx.mlx_stream) ImportStreamKind {
+    if (!mlx.streamIsGpu(s)) return .cpu;
+    return if (mlx.streamIsMetal(s)) .metal else .gpu_other;
+}
+
+fn copyModeFor(kind: ImportStreamKind, env_allows: bool) bool {
+    return kind == .gpu_other and env_allows;
+}
+
+var import_copy_enabled_cache: ?bool = null;
+
+fn importCopyEnabled() bool {
+    if (import_copy_enabled_cache == null) {
+        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_EXPERT_IMPORT_COPY")) |r| std.mem.sliceTo(r, 0) else null;
+        import_copy_enabled_cache = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    }
+    return import_copy_enabled_cache.?;
+}
+
+/// Test hook: forces copy mode on a stream that would not choose it. Metal
+/// streams keep the aliased import no matter what.
+var import_copy_test_override: ?bool = null;
+
+var copy_import_announced = std.atomic.Value(bool).init(false);
+
 const SlabOperand = struct {
     present: bool = false,
     slab: ?*io_mod.PageSlab = null,
@@ -965,20 +1000,26 @@ const SlabOperand = struct {
     array: mlx.mlx_array = .{ .ctx = null },
     stride: usize,
     count: u32,
+    /// Copy mode: `array` is a copy of the slab bytes, re-created by
+    /// `refresh` after every fill. The slab is only a landing buffer.
+    copied: bool = false,
+    dtype: mlx.mlx_dtype = .uint8,
+    shape: [4]c_int = @splat(0),
+    ndim: u8 = 0,
 
     fn absent() SlabOperand {
         return .{ .stride = 0, .count = 0 };
     }
 
-    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32) !SlabOperand {
-        return createTyped(allocator, count, d0, d1, .bfloat16, 2);
+    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, s: mlx.mlx_stream) !SlabOperand {
+        return createTyped(allocator, count, d0, d1, .bfloat16, 2, s);
     }
 
-    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes, s);
     }
 
-    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -993,12 +1034,29 @@ const SlabOperand = struct {
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{});
-        if (!operand.aliased) {
+        var copy_mode = copyModeFor(importStreamKind(s), importCopyEnabled());
+        if (!mlx.streamIsMetal(s)) {
+            if (import_copy_test_override) |forced| copy_mode = forced;
+        }
+        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{ .copy = copy_mode });
+        if (!operand.aliased and !copy_mode) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
         }
-        return .{ .present = true, .slab = slab, .payload = payload, .array = operand.array, .stride = stride, .count = count };
+        if (copy_mode and !copy_import_announced.swap(true, .acq_rel))
+            log.info("[expert-stream] slab import copied (non-Metal): refreshing per fill\n", .{});
+        return .{
+            .present = true,
+            .slab = slab,
+            .payload = payload,
+            .array = operand.array,
+            .stride = stride,
+            .count = count,
+            .copied = copy_mode,
+            .dtype = dtype,
+            .shape = shape,
+            .ndim = @intCast(inner.len + 1),
+        };
     }
 
     fn destroy(self: *SlabOperand, allocator: std.mem.Allocator, s: mlx.mlx_stream) void {
@@ -1066,6 +1124,24 @@ const SlabOperand = struct {
         errdefer _ = mlx.mlx_array_free(handle);
         try mlx.check(mlx.mlx_array_set(&handle, self.array));
         return handle;
+    }
+
+    /// Copy mode only: re-creates the device array from the current slab
+    /// bytes so a completed fill is visible to every consumer, then frees
+    /// the previous array. Freeing is safe while graphs are queued: they
+    /// hold their own references to the old buffer. Returns the bytes
+    /// copied; 0 when the operand is not in copy mode. The import evals on
+    /// the default stream, so the fresh bytes are resident before any
+    /// consumer orders the array onto the engine stream.
+    fn refresh(self: *SlabOperand) !u64 {
+        if (!self.copied or !self.present) return 0;
+        const slab = self.slab orelse return error.MissingExpertSlab;
+        const payload = self.payload orelse return error.MissingExpertSlab;
+        const needed = self.stride * @as(usize, self.count);
+        const fresh = try io_mod.importHostBytes(slab.bytes[0..needed], self.shape[0..@as(usize, self.ndim)], self.dtype, payload, .{ .copy = true });
+        _ = mlx.mlx_array_free(self.array);
+        self.array = fresh.array;
+        return needed;
     }
 };
 
@@ -1224,11 +1300,11 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
-            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes, s)
         else if (spec.exl3)
-            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes, s)
         else
-            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
+            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes, s);
     }
     return slabs;
 }
@@ -1301,6 +1377,8 @@ pub const Engine = struct {
     union_slabs: []SlabOperand = &.{},
     slab_imports: u64 = 0,
     fallback_imports: u64 = 0,
+    copy_bytes_total: u64 = 0,
+    copy_bytes_forward: u64 = 0,
     fill_experts_total: u64 = 0,
     fill_bytes_total: u64 = 0,
     fill_ns_total: u64 = 0,
@@ -1479,6 +1557,7 @@ pub const Engine = struct {
         for (self.layers) |*layer| layer.stats = .{};
         self.route_linear = .{};
         self.route_full = .{};
+        self.copy_bytes_forward = 0;
         self.forward_clock = Clock.init();
     }
 
@@ -1505,11 +1584,13 @@ pub const Engine = struct {
             acc.hits += layer.stats.hits;
             acc.union_members += layer.stats.union_members;
         }
+        acc.copy_bytes = self.copy_bytes_forward;
+        self.copy_bytes_total += self.copy_bytes_forward;
         self.last = acc;
         const scheduled = self.forward_count <= 2 or self.forward_count % BREAKDOWN_EVERY == 0;
         if (!scheduled and !acc.probe) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
-        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d}\n", .{
+        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} copy_mb={d:.1} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d}\n", .{
             acc.forward,
             acc.rows,
             @as(f64, @floatFromInt(acc.wall_ns)) / 1e6,
@@ -1519,6 +1600,7 @@ pub const Engine = struct {
             @as(f64, @floatFromInt(acc.otherNs())) / 1e6,
             @as(f64, @floatFromInt(acc.fill_bytes)) / 1e9,
             if (fill_seconds > 0) @as(f64, @floatFromInt(acc.fill_bytes)) / 1e9 / fill_seconds else 0,
+            @as(f64, @floatFromInt(acc.copy_bytes)) / 1e6,
             acc.fill_bytes / @max(rows, 1),
             acc.hits,
             acc.union_members,
@@ -1711,6 +1793,17 @@ pub const Engine = struct {
         }
         if (!use_union and spans.items.len > 0) wrote_cache = true;
         try self.runFill(layer_index, spans.items);
+        // Copy mode: the fill (or the union slot copies below) landed in the
+        // slabs, so the device arrays must see the new bytes before the
+        // forward consumes them. A non-union all-hit forward touches no
+        // bytes and refreshes nothing.
+        if (use_union or spans.items.len > 0) {
+            for (read_set) |*operand| {
+                const copied = try operand.refresh();
+                self.copy_bytes_forward += copied;
+                self.copy_bytes_total += copied;
+            }
+        }
         self.fill_experts_total += misses;
 
         if (use_union) {
@@ -1724,6 +1817,11 @@ pub const Engine = struct {
                 }
                 layer.cache.markReady(slot);
             }
+            if (wrote_cache) for (layer.slabs) |*operand| {
+                const copied = try operand.refresh();
+                self.copy_bytes_forward += copied;
+                self.copy_bytes_total += copied;
+            };
             for (layer.slabs) |*operand| {
                 if (!operand.present) continue;
                 const slab = operand.slab orelse return error.MissingExpertSlab;
@@ -2308,6 +2406,80 @@ test "expert stream zero copy hit refills nothing and keeps the slab operand" {
     try t.expectEqualSlices(u8, raw[@intCast(gate_span.offset)..][0..@intCast(gate_span.len)], zero.cacheSlotBytes(0, slot, .gate_up));
     const down_span = zero.store.span(0, 1, .down);
     try t.expectEqualSlices(u8, raw[@intCast(down_span.offset)..][0..@intCast(down_span.len)], zero.cacheSlotBytes(0, slot, .down));
+    try t.expectEqual(@as(u64, 0), slab_release_timeouts.load(.monotonic));
+}
+
+test "expert stream copy import gate only engages for non-Metal gpu streams" {
+    const t = std.testing;
+    try t.expect(!copyModeFor(.metal, true));
+    try t.expect(!copyModeFor(.cpu, true));
+    try t.expect(copyModeFor(.gpu_other, true));
+    try t.expect(!copyModeFor(.gpu_other, false));
+}
+
+test "expert stream default import stays aliased on streams that can zero copy" {
+    const t = std.testing;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var operand = try SlabOperand.createShaped(t.allocator, 1, &.{4}, .uint8, 1, s);
+    defer operand.destroy(t.allocator, s);
+    try t.expect(!operand.copied);
+    // The managed import aliases the slab, exactly as on Metal: no copy
+    // bookkeeping, and refresh is a no-op.
+    try t.expectEqual(@intFromPtr(mlx.mlx_array_data_uint8(operand.array).?), @intFromPtr(operand.slab.?.bytes.ptr));
+    try t.expectEqual(@as(u64, 0), try operand.refresh());
+}
+
+test "expert stream copy mode refresh returns the new bytes and re-creates the array" {
+    const t = std.testing;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const saved = import_copy_test_override;
+    import_copy_test_override = true;
+    defer import_copy_test_override = saved;
+    var operand = try SlabOperand.createShaped(t.allocator, 2, &.{3}, .uint8, 1, s);
+    defer operand.destroy(t.allocator, s);
+    try t.expect(operand.copied);
+    _ = try operand.slab.?.tryBeginFill();
+    (try operand.slab.?.writable())[0..3].* = "ABC".*;
+    _ = try operand.slab.?.publish();
+    const held = try operand.slab.?.lease();
+    // The device copy cannot see the fill until refresh runs.
+    const old_ptr = mlx.mlx_array_data_uint8(operand.array).?;
+    try t.expectEqual(@as(u8, 0), old_ptr[0]);
+    try t.expectEqual(@as(u64, operand.stride * operand.count), try operand.refresh());
+    const new_ptr = mlx.mlx_array_data_uint8(operand.array).?;
+    try t.expect(new_ptr != old_ptr);
+    try t.expectEqualSlices(u8, "ABC", new_ptr[0..3]);
+    try t.expectEqualSlices(u8, &.{ 0, 0, 0 }, new_ptr[3..6]);
+    // A second fill refreshes again and the previous array is dropped.
+    try operand.slab.?.release(held);
+    try operand.slab.?.retire();
+    _ = try operand.slab.?.tryBeginFill();
+    (try operand.slab.?.writable())[3..6].* = "DEF".*;
+    _ = try operand.slab.?.publish();
+    _ = try operand.slab.?.lease();
+    try t.expectEqual(@as(u64, operand.stride * operand.count), try operand.refresh());
+    try t.expectEqualSlices(u8, "ABCDEF", mlx.mlx_array_data_uint8(operand.array).?[0..6]);
+    try t.expectEqual(@as(u64, 0), slab_release_timeouts.load(.monotonic));
+}
+
+test "expert stream copy mode refreshes device arrays through prepare" {
+    const t = std.testing;
+    const saved = import_copy_test_override;
+    import_copy_test_override = true;
+    defer import_copy_test_override = saved;
+    var tiny = try TinyEngine.open(2, 4);
+    defer tiny.close();
+    try t.expect(tiny.engine.layers[0].slabs[0].copied);
+    var first = try tiny.engine.prepareHost(0, &.{1});
+    try t.expect(tiny.engine.copy_bytes_forward > 0);
+    const copied_first = tiny.engine.copy_bytes_forward;
+    first.deinit();
+    // A same-expert re-prepare is an all-hit forward: no fill, no refresh.
+    var second = try tiny.engine.prepareHost(0, &.{1});
+    defer second.deinit();
+    try t.expectEqual(copied_first, tiny.engine.copy_bytes_forward);
     try t.expectEqual(@as(u64, 0), slab_release_timeouts.load(.monotonic));
 }
 
