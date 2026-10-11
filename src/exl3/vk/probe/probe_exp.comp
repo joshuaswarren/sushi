@@ -1,0 +1,57 @@
+#version 460
+// Device exp() probe shader (M3dIntegrate): computes the fused kernel's
+// transcendental on raw f32 bit patterns so the host can build the driver's
+// ulp profile. The default arm is the plain GLSL exp() the fused kernel
+// uses; the EXL3_ACCURATE_EXP arm carries the accurately rounded expAcc
+// (same function as src/exl3/vk/exl3_gemv_fused.comp, see the canonical
+// comment there).
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer In { uint g_in[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Out { uint g_out[]; };
+
+layout(push_constant) uniform PC {
+    uint count;
+} pc;
+
+#if defined(EXL3_ACCURATE_EXP)
+float expAcc(float x) {
+    if (x != x) return x;
+    if (x > 88.72283935546875f) return uintBitsToFloat(0x7F800000u);
+    if (x < -103.97208404541029f) return 0.0f;
+    const float INV_LN2 = 1.4426950216293335f;
+    const float LN2_HI = 0.693145751953125f;
+    const float LN2_LO = 1.428606765330187e-06f;
+    float kf = floor(x * INV_LN2 + 0.5f);
+    int k = int(kf);
+    precise float r = fma(-kf, LN2_HI, x);
+    r = fma(-kf, LN2_LO, r);
+    precise float p = 0.00138244335539639f;
+    p = fma(p, r, 0.008371793664991856f);
+    p = fma(p, r, 0.041668254882097244f);
+    p = fma(p, r, 0.16666458547115326f);
+    p = fma(p, r, 0.4999999403953552f);
+    p = fma(p, r, 1.0f);
+    p = fma(p, r, 1.0f);
+    if (k >= -126 && k <= 127) {
+        return p * uintBitsToFloat(uint(k + 127) << 23u);
+    }
+    if (k == 128) {
+        // Exact exponent bump: p * 2^128 cannot round (p < 2) and no literal
+    // fold can overflow the product.
+    return uintBitsToFloat(floatBitsToUint(p) + 0x3F800000u) * 2.0f;
+    }
+    float s = uintBitsToFloat(uint(k + 253) << 23u);
+    return (p * s) * uintBitsToFloat(0x00800000u); // 2^-126
+}
+#define SHADER_EXP(x) expAcc(x)
+#else
+#define SHADER_EXP(x) exp(x)
+#endif
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    float x = uintBitsToFloat(g_in[i]);
+    g_out[i] = floatBitsToUint(SHADER_EXP(x));
+}
