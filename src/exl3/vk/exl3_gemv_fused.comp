@@ -1,0 +1,384 @@
+#version 460
+// EXL3 fused MoE GEMV, Vulkan compute (M3d). Row-1 / small-R decode path:
+// y = x * W with W dequantized from the trellis pack INSIDE the kernel. No
+// f16 weight scratch (the M2 path's Wstr is gone); the only staged state is
+// the per-token transformed input xt (Hadamard+suh, 5 KB per slot) and the
+// f32 GEMV accumulators used by the llvmpipe slab workaround.
+//
+// Reference chain (R1, sushi src/exl3/expert_exl3.zig):
+//   prepareInput :320  xt = H128(f16(x) * f16(suh)), f16 round per 128 block
+//   innerGemv    :333  acc[o] += xt[k] * f16(W[k][o]) in tile order, f16 round
+//   finishOutput :364  out = f16(H128(acc) * f16(svh))
+//   SwiGLU (plainMoeFused semantics) f32 on the finished gate/up
+//   combine: acc += score_j * f32(finished down output), slot order, one
+//   final f16/bf16 round.
+// Every accumulation is a precise f32 chain in the reference order; products
+// are precise so no driver may contract them into an FMA.
+//
+// Two modes cover one MoE layer:
+//   mode 0 (gate+up): one dispatch for ALL top-k slots and rows. Workgroup =
+//   (projection, slot gx, 128-wide output block). Trellis codewords are
+//   extracted and mcg-decoded in registers per output lane.
+//   mode 1 (down): one workgroup per (row, 128-wide hidden block) computes
+//   the SwiGLU h in-kernel from the finished gate/up, xt_d per slot, the
+//   fused GEMV, the output H128+svh, and the router combine. slotout is
+//   never materialized.
+//
+// The tk (in-tile) loop can be slabbed across dispatches (slabLo/slabN,
+// read-modify-write through the f32 acc buffers). Slab boundaries preserve
+// the exact reference accumulation order (k ascending), so correctness does
+// not depend on the slab size; slabbing exists because this llvmpipe build
+// stops long carried-dependency loops (~160 tiles) short. slabN >= inTiles
+// runs the whole GEMV in one dispatch per mode (the device shape).
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer X { float g_x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Slots { uint g_slots[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Scores { float g_scores[]; };
+layout(std430, set = 0, binding = 3) readonly buffer TrelG { uint g_tg[]; };
+layout(std430, set = 0, binding = 4) readonly buffer TrelU { uint g_tu[]; };
+layout(std430, set = 0, binding = 5) readonly buffer TrelD { uint g_td[]; };
+layout(std430, set = 0, binding = 6) readonly buffer SuhG { uint g_suhg[]; };
+layout(std430, set = 0, binding = 7) readonly buffer SuhU { uint g_suhu[]; };
+layout(std430, set = 0, binding = 8) readonly buffer SuhD { uint g_suhd[]; };
+layout(std430, set = 0, binding = 9) readonly buffer SvhG { uint g_svhg[]; };
+layout(std430, set = 0, binding = 10) readonly buffer SvhU { uint g_svhu[]; };
+layout(std430, set = 0, binding = 11) readonly buffer SvhD { uint g_svhd[]; };
+layout(std430, set = 0, binding = 12) buffer Ag { uint g_ag[]; };
+layout(std430, set = 0, binding = 13) buffer Au { uint g_au[]; };
+layout(std430, set = 0, binding = 14) writeonly buffer Out32 { float g_out32[]; };
+layout(std430, set = 0, binding = 15) writeonly buffer Out16 { uint g_out16[]; };
+layout(std430, set = 0, binding = 16) writeonly buffer OutBf { uint g_outbf[]; };
+layout(std430, set = 0, binding = 17) buffer AccG { float g_accg[]; };
+layout(std430, set = 0, binding = 18) buffer AccU { float g_accu[]; };
+layout(std430, set = 0, binding = 19) buffer AccD { float g_accd[]; };
+layout(std430, set = 0, binding = 20) buffer XtG { uint g_xtg[]; };
+layout(std430, set = 0, binding = 21) buffer XtU { uint g_xtu[]; };
+layout(std430, set = 0, binding = 22) buffer XtD { uint g_xtd[]; };
+
+layout(push_constant) uniform PC {
+    uint mode;
+    uint hiddenDim;
+    uint interDim;
+    uint topk;
+    uint packedN;   // packed halfwords per tile (rate.n: 32=2b, 48=3b, 64=4b, 96=6b, 128=8b)
+    uint mask;      // codeword window mask
+    uint limitBits; // SwiGLU clamp magnitude as f32 bits, 0 = no clamp
+    uint slabLo;    // first in-tile of this dispatch's slab
+    uint slabN;     // in-tiles per dispatch
+} pc;
+
+const float HAD_SCALE = 0.08838834764831845;
+const uint MCG_MULT = 0xCBAC1FEDu;
+
+float f16ToF32(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint man = h & 0x3FFu;
+    uint bits;
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign << 31;
+        } else {
+            uint m = man;
+            uint s = 0u;
+            while ((m & 0x200u) == 0u) { m <<= 1; s++; }
+            bits = (sign << 31) | ((112u - s) << 23) | ((m & 0x1FFu) << 14);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31) | (0xFFu << 23) | (man << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (man << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+uint f32ToF16(float v) {
+    uint b = floatBitsToUint(v);
+    uint sign = (b >> 16) & 0x8000u;
+    uint exp = (b >> 23) & 0xFFu;
+    uint man = b & 0x7FFFFFu;
+    if (exp == 0xFFu) {
+        return sign | 0x7C00u | (man != 0u ? 0x0200u : 0u);
+    }
+    int ne = int(exp) - 127 + 15;
+    if (ne >= 31) return sign | 0x7C00u;
+    if (ne <= 0) {
+        if (ne < -10) return sign;
+        uint m = man | 0x800000u;
+        uint shift = uint(14 - ne);
+        uint rem = m & ((1u << shift) - 1u);
+        uint h16 = m >> shift;
+        uint halfUlp = 1u << (shift - 1u);
+        if (rem > halfUlp || (rem == halfUlp && (h16 & 1u) == 1u)) h16++;
+        return sign | h16;
+    }
+    uint h16 = (uint(ne) << 10) | (man >> 13);
+    uint rem = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && ((man >> 13) & 1u) == 1u)) h16++;
+    if (h16 >= 0x7C00u) return sign | 0x7C00u;
+    return sign | h16;
+}
+
+uint f32ToBf16(uint b) {
+    uint lsb = (b >> 16) & 1u;
+    return (b + 0x7FFFu + lsb) >> 16;
+}
+
+// expert_exl3.zig decodeMcg (:141): u32 mul + XOR, f32 add of the f16 halves,
+// RNE round to f16. Bit-exact integer/float chain, proven in M1.
+uint decodeMcg(uint cw) {
+    uint mixed = cw * MCG_MULT;
+    uint pair = 0x3B603B60u ^ (mixed & 0x8FFF8FFFu);
+    float lo = f16ToF32(pair & 0xFFFFu);
+    float hi = f16ToF32(pair >> 16);
+    return f32ToF16(lo + hi);
+}
+
+// Codeword index i (0..255) placed at tile position (r, c): inverse of
+// tensorCorePerm (:226). perm2(i): p_thread = i>>3, j = i&7, col0 = p_thread>>2,
+// row = row0 + {0,1,8,9}[j&3] with row0 = (p_thread&3)*2, col = col0 + 8*(j>=4).
+uint codewordIndex(uint r, uint c) {
+    uint pThread = (c & 7u) * 4u + ((r & 6u) >> 1);
+    uint j = ((r >> 3) << 1) + (r & 1u) + ((c >= 8u) ? 4u : 0u);
+    return pThread * 8u + j;
+}
+
+shared uint s_xt[2560];   // f16 bits, transformed input for one slot (mode 0)
+shared uint s_xtd[640];   // f16 bits, transformed SwiGLU output per slot (mode 1)
+shared float s_h[640];    // SwiGLU output staging (mode 1, slab 0 only)
+shared float s_fin[128];  // f32 accumulator exchange for the output H128
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint hidden = pc.hiddenDim;
+    uint inter = pc.interDim;
+
+    if (pc.mode == 0u) {
+        // --- gate + up: workgroup = (proj, slot gx, 128-output block) -----
+        uint outBlocks = inter >> 7;
+        uint per = uint(gl_NumWorkGroups.x) / 2u;   // rts * outBlocks
+        uint proj = gl_WorkGroupID.x / per;
+        uint rem = gl_WorkGroupID.x % per;
+        uint gx = rem / outBlocks;
+        uint blk = rem % outBlocks;
+        uint inDim = hidden;
+        uint outDim = inter;
+        uint inTiles = inDim >> 4;
+        uint outTiles = outDim >> 4;
+        uint tkLo = pc.slabLo * pc.slabN;
+        uint tkHi = tkLo + pc.slabN;
+        if (tkHi > inTiles) tkHi = inTiles;
+
+        uint e = g_slots[gx];
+        uint suhBase = e * inDim;
+        // xt: prepare in slab 0 (and stage to global for later slabs), else load.
+        if (pc.slabLo == 0u) {
+            for (uint el = lid; el < inDim; el += 128u) {
+                uint boff = el & ~127u;
+                precise float acc = 0.0;
+                for (uint k = 0u; k < 128u; k++) {
+                    float xv = f16ToF32(f32ToF16(g_x[(gx / pc.topk) * inDim + boff + k]));
+                    uint sb = (proj == 0u) ? g_suhg[suhBase + boff + k]
+                            : g_suhu[suhBase + boff + k];
+                    float prod = xv * f16ToF32(sb);
+                    float he = (bitCount((el & 127u) & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+                    acc = acc + he * prod;
+                }
+                uint bits = f32ToF16(acc);
+                s_xt[el] = bits;
+                if (proj == 0u) g_xtg[gx * inDim + el] = bits;
+                else g_xtu[gx * inDim + el] = bits;
+            }
+        } else {
+            for (uint el = lid; el < inDim; el += 128u) {
+                s_xt[el] = (proj == 0u) ? g_xtg[gx * inDim + el]
+                        : g_xtu[gx * inDim + el];
+            }
+        }
+        barrier();
+
+        // GEMV over this slab, one output per lane, exact reference order
+        // (tk ascending, r ascending within the tile).
+        uint oLocal = lid;                  // 128 outputs per block
+        uint oGlob = blk * 128u + oLocal;
+        uint tn = oGlob >> 4;
+        uint c = oGlob & 15u;
+        precise float acc = 0.0;
+        if (tkLo > 0u) {
+            acc = (proj == 0u) ? g_accg[gx * outDim + oGlob]
+                : g_accu[gx * outDim + oGlob];
+        }
+        for (uint tk = tkLo; tk < tkHi; tk++) {
+            for (uint r = 0u; r < 16u; r++) {
+                float xtv = f16ToF32(s_xt[tk * 16u + r]);
+                uint cw = codewordIndex(r, c);
+                uint pair = cw >> 1;
+                uint parity = cw & 1u;
+                uint wc = pc.packedN >> 1;
+                uint total = pc.packedN << 4;
+                uint e0 = ((pair * 2u + 1u) * pc.packedN) >> 4;
+                uint e1 = ((pair * 2u + 2u) * pc.packedN) >> 4;
+                uint bit0 = e0 + total - 16u;
+                uint bit2 = e1 + total;
+                uint i0 = bit0 >> 5;
+                uint i1 = (bit2 - 1u) >> 5;
+                uint shift = (i1 + 1u) * 32u - bit2;
+                uint wordBase = e * ((inTiles * outTiles * pc.packedN) >> 1)
+                              + (((tk * outTiles + tn) * pc.packedN) >> 1);
+                uint wa = (proj == 0u) ? g_tg[wordBase + (i0 % wc)]
+                        : g_tu[wordBase + (i0 % wc)];
+                uint wb = (proj == 0u) ? g_tg[wordBase + (i1 % wc)]
+                        : g_tu[wordBase + (i1 % wc)];
+                uint funnel = (shift == 0u) ? wb
+                            : (shift >= 32u) ? wa
+                            : ((wa << (32u - shift)) | (wb >> shift));
+                uint fresh = e1 - e0;
+                uint raw = (parity == 0u) ? ((funnel >> fresh) & 0xFFFFu)
+                          : (funnel & 0xFFFFu);
+                precise float prod = xtv * f16ToF32(decodeMcg(raw & pc.mask));
+                acc = acc + prod;
+            }
+        }
+        if (tkHi < inTiles) {
+            if (proj == 0u) g_accg[gx * outDim + oGlob] = acc;
+            else g_accu[gx * outDim + oGlob] = acc;
+        } else {
+            // Last slab: f16 round, output H128, * svh, f16 round (finishOutput).
+            s_fin[oLocal] = acc;
+            barrier();
+            precise float ha = 0.0;
+            for (uint k = 0u; k < 128u; k++) {
+                float v = f16ToF32(f32ToF16(s_fin[k]));
+                float he = (bitCount(oLocal & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+                ha = ha + he * v;
+            }
+            uint sv = (proj == 0u) ? g_svhg[e * outDim + oGlob]
+                    : g_svhu[e * outDim + oGlob];
+            uint bits = f32ToF16(ha * f16ToF32(sv));
+            if (proj == 0u) g_ag[gx * outDim + oGlob] = bits;
+            else g_au[gx * outDim + oGlob] = bits;
+        }
+    } else {
+        // --- down + SwiGLU + combine: workgroup = (row, 128-output block) -
+        uint outBlocks = hidden >> 7;
+        uint row = gl_WorkGroupID.x / outBlocks;
+        uint blk = gl_WorkGroupID.x % outBlocks;
+        uint inDim = inter;
+        uint outDim = hidden;
+        uint inTiles = inDim >> 4;
+        uint outTiles = outDim >> 4;
+        uint tkLo = pc.slabLo * pc.slabN;
+        uint tkHi = tkLo + pc.slabN;
+        if (tkHi > inTiles) tkHi = inTiles;
+        bool last = tkHi >= inTiles;
+        float lim = uintBitsToFloat(pc.limitBits);
+
+        uint oLocal = lid;
+        uint oGlob = blk * 128u + oLocal;
+        uint tn = oGlob >> 4;
+        uint c = oGlob & 15u;
+        precise float combined = 0.0;
+
+        for (uint j = 0u; j < pc.topk; j++) {
+            uint gx = row * pc.topk + j;
+            uint e = g_slots[gx];
+            // Top-of-loop barrier: the previous slot's GEMV reads of s_xtd
+            // (and finish reads of s_fin) complete before this slot's
+            // prep overwrites the shared staging.
+            barrier();
+            if (pc.slabLo == 0u) {
+                // SwiGLU h in f32 (plainMoeFused semantics), then
+                // xt_d = H128(f16(h) * f16(suhd)) per 128 block, f16 round.
+                for (uint el = lid; el < inDim; el += 128u) {
+                    precise float a = f16ToF32(g_ag[gx * inDim + el]);
+                    precise float u = f16ToF32(g_au[gx * inDim + el]);
+                    if (lim > 0.0) {
+                        a = min(a, lim);
+                        float am = min(abs(u), lim);
+                        u = (u < 0.0) ? -am : am;
+                    }
+                    precise float sig = 1.0 / (1.0 + exp(-a));
+                    s_h[el] = (a * sig) * u;
+                }
+                barrier();
+                for (uint el = lid; el < inDim; el += 128u) {
+                    uint boff = el & ~127u;
+                    precise float acc = 0.0;
+                    for (uint k = 0u; k < 128u; k++) {
+                        float hv = f16ToF32(f32ToF16(s_h[boff + k]));
+                        float prod = hv * f16ToF32(g_suhd[e * inDim + boff + k]);
+                        float he = (bitCount((el & 127u) & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+                        acc = acc + he * prod;
+                    }
+                    uint bits = f32ToF16(acc);
+                    s_xtd[el] = bits;
+                    g_xtd[gx * inDim + el] = bits;
+                }
+                barrier();
+            } else {
+                for (uint el = lid; el < inDim; el += 128u) {
+                    s_xtd[el] = g_xtd[gx * inDim + el];
+                }
+                barrier();
+            }
+
+            // Fused down GEMV slab for this slot.
+            precise float acc = 0.0;
+            if (tkLo > 0u) acc = g_accd[gx * outDim + oGlob];
+            for (uint tk = tkLo; tk < tkHi; tk++) {
+                for (uint r = 0u; r < 16u; r++) {
+                    float xtv = f16ToF32(s_xtd[tk * 16u + r]);
+                    uint cw = codewordIndex(r, c);
+                    uint pair = cw >> 1;
+                    uint parity = cw & 1u;
+                    uint wc = pc.packedN >> 1;
+                    uint total = pc.packedN << 4;
+                    uint e0 = ((pair * 2u + 1u) * pc.packedN) >> 4;
+                    uint e1 = ((pair * 2u + 2u) * pc.packedN) >> 4;
+                    uint bit0 = e0 + total - 16u;
+                    uint bit2 = e1 + total;
+                    uint i0 = bit0 >> 5;
+                    uint i1 = (bit2 - 1u) >> 5;
+                    uint shift = (i1 + 1u) * 32u - bit2;
+                    uint wordBase = e * ((inTiles * outTiles * pc.packedN) >> 1)
+                                  + (((tk * outTiles + tn) * pc.packedN) >> 1);
+                    uint wa = g_td[wordBase + (i0 % wc)];
+                    uint wb = g_td[wordBase + (i1 % wc)];
+                    uint funnel = (shift == 0u) ? wb
+                                : (shift >= 32u) ? wa
+                                : ((wa << (32u - shift)) | (wb >> shift));
+                    uint fresh = e1 - e0;
+                    uint raw = (parity == 0u) ? ((funnel >> fresh) & 0xFFFFu)
+                              : (funnel & 0xFFFFu);
+                    precise float prod = xtv * f16ToF32(decodeMcg(raw & pc.mask));
+                    acc = acc + prod;
+                }
+            }
+            if (!last) {
+                g_accd[gx * outDim + oGlob] = acc;
+            } else {
+                // finishOutput: f16 round, H128, * svhd, f16 round; combine
+                // uses the f32 finished value (reference applies the score
+                // before any round); slotout is not materialized.
+                s_fin[oLocal] = acc;
+                barrier();
+                precise float ha = 0.0;
+                for (uint k = 0u; k < 128u; k++) {
+                    float v = f16ToF32(f32ToF16(s_fin[k]));
+                    float he = (bitCount(oLocal & k) & 1u) == 0u ? HAD_SCALE : -HAD_SCALE;
+                    ha = ha + he * v;
+                }
+                float y2f = ha * f16ToF32(g_svhd[e * outDim + oGlob]);
+                y2f = f16ToF32(f32ToF16(y2f)); /* finishOutput rounds to f16; the combine consumes the rounded value */
+                combined = combined + g_scores[row * pc.topk + j] * y2f;
+            }
+        }
+        if (last) {
+            uint rowBase = row * outDim + oGlob;
+            g_out32[rowBase] = combined;
+            g_out16[rowBase] = f32ToF16(combined);
+            g_outbf[rowBase] = f32ToBf16(floatBitsToUint(combined));
+        }
+    }
+}
