@@ -10259,7 +10259,109 @@ test "exl3 clamped routing preserves GLM production width bytes" {
     };
 }
 
-test "exl3 vk route matches the project chain at pack shapes" {
+/// Round-to-nearest-even f32 -> bf16 bits, so the oracle consumes exactly
+/// the x values the bf16 route input carries.
+fn bf16RneBits(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    const lsb: u32 = (b >> 16) & 1;
+    return @truncate((b + 0x7FFF + lsb) >> 16);
+}
+
+/// Double-precision host oracle for the vk route: decode every expert with
+/// the in-tree reference decoder (the same reconstructPublic the decode
+/// isolation gate pins bit-exact against the shipped kernel) and run the
+/// clamped routed MoE in f64. No custom kernels, so it runs on any stream.
+fn f64ClampedMoeReference(
+    alloc: std.mem.Allocator,
+    f: *const MimoMoeFixture,
+    c_hidden: usize,
+    c_inter: usize,
+    e: usize,
+    rows: usize,
+    topk: usize,
+    rate: exl3.Rate,
+    dec: exl3.Decode,
+    limit: c_int,
+    out: []f64,
+) !void {
+    const n = rate.halfwords();
+    const gu_tile = (c_hidden / 16) * (c_inter / 16) * n;
+    const w = try alloc.alloc(u16, c_hidden * c_inter);
+    defer alloc.free(w);
+    const wu = try alloc.alloc(u16, c_hidden * c_inter);
+    defer alloc.free(wu);
+    const wd = try alloc.alloc(u16, c_inter * c_hidden);
+    defer alloc.free(wd);
+    @memset(out, 0);
+    const lim: f64 = @floatFromInt(limit);
+    const act = try alloc.alloc(f64, c_inter);
+    defer alloc.free(act);
+    for (0..e) |ef| {
+        try exl3.reconstructPublic(
+            alloc,
+            f.gate_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_h[ef * c_hidden ..][0..c_hidden],
+            f.svh_i[ef * c_inter ..][0..c_inter],
+            c_hidden,
+            c_inter,
+            rate,
+            dec,
+            w,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            f.up_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_h[ef * c_hidden ..][0..c_hidden],
+            f.svh_i[ef * c_inter ..][0..c_inter],
+            c_hidden,
+            c_inter,
+            rate,
+            dec,
+            wu,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            f.down_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_i[ef * c_inter ..][0..c_inter],
+            f.svh_h[ef * c_hidden ..][0..c_hidden],
+            c_inter,
+            c_hidden,
+            rate,
+            dec,
+            wd,
+        );
+        for (0..rows) |r| {
+            for (0..topk) |k| {
+                if (f.slots[r * topk + k] != ef) continue;
+                for (0..c_inter) |j| {
+                    var h: f64 = 0;
+                    var u: f64 = 0;
+                    for (0..c_hidden) |t| {
+                        const xb: u16 = bf16RneBits(f.xf[r * c_hidden + t]);
+                        const xv: f64 = @as(f32, @bitCast(@as(u32, xb) << 16));
+                        h += xv * @as(f64, exl3.f16BitsToF32(w[t * c_inter + j]));
+                        u += xv * @as(f64, exl3.f16BitsToF32(wu[t * c_inter + j]));
+                    }
+                    if (lim > 0) {
+                        if (h > lim) h = lim; // gate: upper clamp only
+                        if (u > lim) u = lim; // up: symmetric clamp
+                        if (u < -lim) u = -lim;
+                    }
+                    act[j] = (1.0 / (1.0 + @exp(-h))) * u;
+                }
+                for (0..c_hidden) |o| {
+                    var d: f64 = 0;
+                    for (0..c_inter) |t| {
+                        d += act[t] * @as(f64, exl3.f16BitsToF32(wd[t * c_hidden + o]));
+                    }
+                    out[r * c_hidden + o] += @as(f64, f.scores[r * topk + k]) * d;
+                }
+            }
+        }
+    }
+}
+
+test "exl3 vk route matches the f64 host oracle at pack shapes" {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -10268,7 +10370,7 @@ test "exl3 vk route matches the project chain at pack shapes" {
     // shift-heavy decode kernel class (m3a receipt), so the composed
     // op's decode legs produce garbage there. On that shim only route
     // engagement and the shape/dtype contract are checked; the numeric
-    // comparison against the chain oracle needs the real device.
+    // comparison against the f64 oracle needs the real device.
     const ct_shim = if (std.c.getenv("MLX_OMARCHY_ALLOW_NON_APPLE")) |v|
         std.mem.eql(u8, std.mem.span(v), "1")
     else
@@ -10310,27 +10412,25 @@ test "exl3 vk route matches the project chain at pack shapes" {
             if (ct_shim) {
                 std.debug.print("exl3 vk route rows={d} limit={d}: engagement-only (recorded lavapipe shim miscompile)\n", .{ rows, limit });
             } else {
-                // Chain oracle: the same sorted prepared chain the Metal arm
-                // serves (on non-Metal it runs the plain-MLX fallback arms).
-                // Tolerance 0.02 + 0.01*|ref| per element: both sides decode
-                // identical f16 weights (the decode-isolation gate is
-                // bit-exact), so what differs is accumulation order in the
-                // f32 matmuls plus the bf16 output rounding (ulp ~ 0.004*|v|).
-                const old = try clampedSortedReference(s, x, f.arrays[0], f.arrays[3], f.arrays[4], f.arrays[1], f.arrays[3], f.arrays[4], f.arrays[2], f.arrays[5], f.arrays[6], f.arrays[7], f.arrays[9], 10, limit, .float32);
-                defer _ = mlx.mlx_array_free(old);
+                // f64 host oracle (see f64ClampedMoeReference): no custom
+                // kernels, runs on the Vulkan stream's host side only.
+                // Tolerance 0.02 + 0.01*|ref| per element: the oracle is
+                // f64 with the same clamp order, so what differs is the
+                // composed path's f32 matmul accumulation plus the bf16
+                // output rounding (ulp ~ 0.004*|v|).
+                const ref = try alloc.alloc(f64, rows * 2560);
+                try f64ClampedMoeReference(alloc, &f, 2560, 640, 16, rows, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, limit, ref);
                 var got32 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(got32);
                 try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
                 try mlx.check(mlx.mlx_array_eval(got32));
-                try mlx.check(mlx.mlx_array_eval(old));
                 const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
-                const r = mlx.mlx_array_data_float32(old) orelse return error.F32Unreadable;
                 var worst: f32 = 0;
                 for (0..rows * 2560) |i| {
-                    const diff = @abs(g[i] - r[i]);
-                    const tol = 0.02 + 0.01 * @abs(r[i]);
+                    const diff = @abs(@as(f64, g[i]) - ref[i]);
+                    const tol = 0.02 + 0.01 * @abs(ref[i]);
                     if (diff > tol) return error.VkRouteDiverged;
-                    worst = @max(worst, diff);
+                    worst = @max(worst, @as(f32, @floatCast(diff)));
                 }
                 std.debug.print("exl3 vk route rows={d} limit={d}: worst |diff| {d:.6}\n", .{ rows, limit, worst });
             }
