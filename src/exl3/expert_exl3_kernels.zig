@@ -3544,6 +3544,135 @@ fn clampedWindowTable(s: mlx.mlx_stream, ids: mlx.mlx_array, order: mlx.mlx_arra
     return .{ .table = try gemmWindowTable(s, ids, n, win, aligned), .inverse = .{ .ctx = null } };
 }
 
+/// Calls accepted by the vk route since process start. The test snapshots
+/// this around a call to prove the route engaged instead of silently
+/// falling back to the host loop.
+pub var vk_route_calls: usize = 0;
+
+var vk_fallback_logged = std.atomic.Value(bool).init(false);
+
+/// The non-Metal GPU route is on by default; SUSHI_EXL3_HOST=1 forces the
+/// host plainMoeFused loop. The composed primitive implements the MCG
+/// codebook (every current pack), so other codebooks stay on the host.
+fn exl3VkRouteOn(s: mlx.mlx_stream) bool {
+    if (std.c.getenv("SUSHI_EXL3_HOST")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "1")) return false;
+    }
+    return mlx.streamIsGpu(s) and active_decode.codebook == .mcg;
+}
+
+fn hostMoeFallback(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    return plainMoeFused(arena.allocator(), s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype);
+}
+
+/// One non-Metal MoE call through the omarchy-mlx composed primitive
+/// (mlx_fast_exl3_moe, the M3b C ABI): decodes the trellis banks and runs
+/// the routed clamped SwiGLU on the stream's device. Falls back to the
+/// host plainMoeFused loop when the op declines, quoting its error once.
+fn vkMoeFused(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const rows: c_int = if (sh.len == 1) 1 else sh[0];
+    // The C ABI takes the slot/score tables as [rows, topk]; sushi hands
+    // them over flattened.
+    var slots2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(slots2);
+    try mlx.check(mlx.mlx_reshape(&slots2, slots, &[_]c_int{ rows, topk }, 2, s));
+    var scores2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores2);
+    try mlx.check(mlx.mlx_reshape(&scores2, scores, &[_]c_int{ rows, topk }, 2, s));
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const t_start = std.Io.Timestamp.now(io, .boot);
+    // Zeroed handle: mlx_array_set_ takes ownership on success (the m3b
+    // acceptance test calls the same ABI this way), and a failed call
+    // leaves it empty, so the fallback path has nothing to free.
+    var y = mlx.mlx_array{};
+    const rc = mlx.mlx_fast_exl3_moe(&y, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots2, scores2, topk, @intCast(active_decode.window.bits()), @floatFromInt(limit), out_dtype, s);
+    if (rc != 0) {
+        var msg: [512]u8 = undefined;
+        const text = mlx.takeError(&msg);
+        if (!vk_fallback_logged.swap(true, .monotonic))
+            log.warn("[exl3-vk] mlx_fast_exl3_moe failed ({s}); staying on the host plain path\n", .{text orelse "mlx error"});
+        return hostMoeFallback(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype);
+    }
+    vk_route_calls += 1;
+    // SUSHI_EXL3_LAYER_UBENCH drains the stream first, turning the ms into
+    // a real GPU wall time; without it the ms measures enqueue cost.
+    if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(y));
+    const ms = @divTrunc(t_start.untilNow(io, .boot).nanoseconds, 1_000_000);
+    log.info("[exl3-vk] rows={d} slots={d} {d} ms\n", .{ rows, rows * topk, ms });
+    return y;
+}
+
+const VkMoeRoute = enum { vk, host };
+
+fn moeSwigluOne(
+    route: VkMoeRoute,
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) !mlx.mlx_array {
+    return switch (route) {
+        .vk => vkMoeFused(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype),
+        .host => hostMoeFallback(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype),
+    };
+}
+
 pub fn moeSwigluClamped(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -3563,21 +3692,46 @@ pub fn moeSwigluClamped(
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
     if (!mlx.streamIsMetal(s)) {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
         const sh_n = mlx.getShape(x);
         const inter_n: c_int = mlx.getShape(gate_t)[2] * 16;
-        // plainMoeFused is a host loop bounded to 32M elements of x and 64K
-        // slots; serve wide prefills in row chunks within those caps (decode
-        // stays one chunk, whole prefills up to the bound stay one chunk).
-        // Chunks are row-independent, so results are identical.
+        // Both non-Metal routes serve wide prefills in row chunks within
+        // the host caps (32M elements of x, 64K slots): the composed op
+        // bounds its x-side intermediates the same way. Chunks are
+        // row-independent, so results are identical.
         const rows_n: c_int = if (sh_n.len == 1) 1 else sh_n[0];
         const dim_n: c_int = if (sh_n.len == 1) sh_n[0] else sh_n[1];
         const chunk_rows: c_int = @min(
             @max(1, @divTrunc(32 * 1024 * 1024, @max(dim_n, 1))),
             @max(1, @divTrunc(65536, @max(topk, 1))),
         );
+        if (exl3VkRouteOn(s)) {
+            const route: VkMoeRoute = .vk;
+            if (rows_n <= chunk_rows)
+                return moeSwigluOne(route, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
+            const parts = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(parts);
+            var r0: c_int = 0;
+            while (r0 < rows_n) : (r0 += chunk_rows) {
+                const r1: c_int = @min(r0 + chunk_rows, rows_n);
+                const xc = try sliceRows(x, r0, r1, s);
+                defer _ = mlx.mlx_array_free(xc);
+                const slot_c = try sliceRows(slots, r0 * topk, r1 * topk, s);
+                defer _ = mlx.mlx_array_free(slot_c);
+                const score_c = try sliceRows(scores, r0 * topk, r1 * topk, s);
+                defer _ = mlx.mlx_array_free(score_c);
+                const yc = try moeSwigluOne(route, s, xc, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slot_c, score_c, dim_n, inter_n, topk, limit, out_dtype);
+                errdefer _ = mlx.mlx_array_free(yc);
+                try mlx.check(mlx.mlx_vector_array_append_value(parts, yc));
+                _ = mlx.mlx_array_free(yc);
+            }
+            var yv = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(yv);
+            try mlx.check(mlx.mlx_concatenate_axis(&yv, parts, 0, s));
+            return yv;
+        }
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
         if (rows_n <= chunk_rows)
             return plainMoeFused(alloc, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
         const parts = mlx.mlx_vector_array_new();
@@ -10103,6 +10257,185 @@ test "exl3 clamped routing preserves GLM production width bytes" {
         try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
         try std.testing.expectEqualSlices(u8, try gemvOutBytes(old32), try gemvOutBytes(got32));
     };
+}
+
+/// Round-to-nearest-even f32 -> bf16 bits, so the oracle consumes exactly
+/// the x values the bf16 route input carries.
+fn bf16RneBits(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    const lsb: u32 = (b >> 16) & 1;
+    return @truncate((b + 0x7FFF + lsb) >> 16);
+}
+
+/// Double-precision host oracle for the vk route: decode every expert with
+/// the in-tree reference decoder (the same reconstructPublic the decode
+/// isolation gate pins bit-exact against the shipped kernel) and run the
+/// clamped routed MoE in f64. No custom kernels, so it runs on any stream.
+fn f64ClampedMoeReference(
+    alloc: std.mem.Allocator,
+    f: *const MimoMoeFixture,
+    c_hidden: usize,
+    c_inter: usize,
+    e: usize,
+    rows: usize,
+    topk: usize,
+    rate: exl3.Rate,
+    dec: exl3.Decode,
+    limit: c_int,
+    out: []f64,
+) !void {
+    const n = rate.halfwords();
+    const gu_tile = (c_hidden / 16) * (c_inter / 16) * n;
+    const w = try alloc.alloc(u16, c_hidden * c_inter);
+    defer alloc.free(w);
+    const wu = try alloc.alloc(u16, c_hidden * c_inter);
+    defer alloc.free(wu);
+    const wd = try alloc.alloc(u16, c_inter * c_hidden);
+    defer alloc.free(wd);
+    @memset(out, 0);
+    const lim: f64 = @floatFromInt(limit);
+    const act = try alloc.alloc(f64, c_inter);
+    defer alloc.free(act);
+    for (0..e) |ef| {
+        try exl3.reconstructPublic(
+            alloc,
+            f.gate_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_h[ef * c_hidden ..][0..c_hidden],
+            f.svh_i[ef * c_inter ..][0..c_inter],
+            c_hidden,
+            c_inter,
+            rate,
+            dec,
+            w,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            f.up_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_h[ef * c_hidden ..][0..c_hidden],
+            f.svh_i[ef * c_inter ..][0..c_inter],
+            c_hidden,
+            c_inter,
+            rate,
+            dec,
+            wu,
+        );
+        try exl3.reconstructPublic(
+            alloc,
+            f.down_t[ef * gu_tile ..][0..gu_tile],
+            f.suh_i[ef * c_inter ..][0..c_inter],
+            f.svh_h[ef * c_hidden ..][0..c_hidden],
+            c_inter,
+            c_hidden,
+            rate,
+            dec,
+            wd,
+        );
+        for (0..rows) |r| {
+            for (0..topk) |k| {
+                if (f.slots[r * topk + k] != ef) continue;
+                for (0..c_inter) |j| {
+                    var h: f64 = 0;
+                    var u: f64 = 0;
+                    for (0..c_hidden) |t| {
+                        const xb: u16 = bf16RneBits(f.xf[r * c_hidden + t]);
+                        const xv: f64 = @as(f32, @bitCast(@as(u32, xb) << 16));
+                        h += xv * @as(f64, exl3.f16BitsToF32(w[t * c_inter + j]));
+                        u += xv * @as(f64, exl3.f16BitsToF32(wu[t * c_inter + j]));
+                    }
+                    if (lim > 0) {
+                        if (h > lim) h = lim; // gate: upper clamp only
+                        if (u > lim) u = lim; // up: symmetric clamp
+                        if (u < -lim) u = -lim;
+                    }
+                    act[j] = (1.0 / (1.0 + @exp(-h))) * u;
+                }
+                for (0..c_hidden) |o| {
+                    var d: f64 = 0;
+                    for (0..c_inter) |t| {
+                        d += act[t] * @as(f64, exl3.f16BitsToF32(wd[t * c_hidden + o]));
+                    }
+                    out[r * c_hidden + o] += @as(f64, f.scores[r * topk + k]) * d;
+                }
+            }
+        }
+    }
+}
+
+test "exl3 vk route matches the f64 host oracle at pack shapes" {
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The CT harness runs the recorded stock-Mesa lavapipe shim
+    // (MLX_OMARCHY_ALLOW_NON_APPLE=1): llvmpipe miscompiles the
+    // shift-heavy decode kernel class (m3a receipt), so the composed
+    // op's decode legs produce garbage there. On that shim only route
+    // engagement and the shape/dtype contract are checked; the numeric
+    // comparison against the f64 oracle needs the real device.
+    const ct_shim = if (std.c.getenv("MLX_OMARCHY_ALLOW_NON_APPLE")) |v|
+        std.mem.eql(u8, std.mem.span(v), "1")
+    else
+        false;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    setDecodeParams(.{ .codebook = .mcg, .window = .w15 });
+    defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
+
+    inline for (.{ 1, 2 }) |rows| {
+        inline for (.{ 0, 5 }) |limit| {
+            var f = try mimoMoeFixture(alloc, .{
+                .e = 16,
+                .hidden = 2560,
+                .inter = 640,
+                .topk = 10,
+                .rows = rows,
+                .rate = .{ .n = 32 },
+                .dec = .{ .codebook = .mcg, .window = .w15 },
+                .seed = 9700 + rows * 10 + limit,
+                .x_scale = 8,
+            });
+            defer f.deinit();
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, f.arrays[8], .bfloat16, s));
+            const calls0 = vk_route_calls;
+            const got = try moeSwigluClamped(s, x, f.arrays[0], f.arrays[3], f.arrays[4], f.arrays[1], f.arrays[3], f.arrays[4], f.arrays[2], f.arrays[5], f.arrays[6], f.arrays[7], f.arrays[9], 10, limit, .bfloat16);
+            defer _ = mlx.mlx_array_free(got);
+            // The route engaged: the composed op accepted the call (a
+            // silent fallback to plainMoeFused would not advance the
+            // counter; the op error path logs and takes the host loop).
+            try std.testing.expect(vk_route_calls > calls0);
+            try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got)[0])));
+            try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got)[1]);
+            try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+            if (ct_shim) {
+                std.debug.print("exl3 vk route rows={d} limit={d}: engagement-only (recorded lavapipe shim miscompile)\n", .{ rows, limit });
+            } else {
+                // f64 host oracle (see f64ClampedMoeReference): no custom
+                // kernels, runs on the Vulkan stream's host side only.
+                // Tolerance 0.02 + 0.01*|ref| per element: the oracle is
+                // f64 with the same clamp order, so what differs is the
+                // composed path's f32 matmul accumulation plus the bf16
+                // output rounding (ulp ~ 0.004*|v|).
+                const ref = try alloc.alloc(f64, rows * 2560);
+                try f64ClampedMoeReference(alloc, &f, 2560, 640, 16, rows, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, limit, ref);
+                var got32 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got32);
+                try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(got32));
+                const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
+                var worst: f32 = 0;
+                for (0..rows * 2560) |i| {
+                    const diff = @abs(@as(f64, g[i]) - ref[i]);
+                    const tol = 0.02 + 0.01 * @abs(ref[i]);
+                    if (diff > tol) return error.VkRouteDiverged;
+                    worst = @max(worst, @as(f32, @floatCast(diff)));
+                }
+                std.debug.print("exl3 vk route rows={d} limit={d}: worst |diff| {d:.6}\n", .{ rows, limit, worst });
+            }
+        }
+    }
 }
 
 test "exl3 unsorted paired prepare preserves distinct scale planes at GLM widths" {
