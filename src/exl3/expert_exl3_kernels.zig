@@ -3554,6 +3554,26 @@ var vk_fallback_logged = std.atomic.Value(bool).init(false);
 /// The non-Metal GPU route is on by default; SUSHI_EXL3_HOST=1 forces the
 /// host plainMoeFused loop. The composed primitive implements the MCG
 /// codebook (every current pack), so other codebooks stay on the host.
+/// Largest single storage-buffer binding the non-Metal device accepts. Honeykrisp
+/// reports maxStorageBufferRange 2 GiB (jw16 serve.log 2026-10-11); a bigger one-binding
+/// array dies in Gather before allocation is even attempted.
+pub const VK_MAX_BINDING_BYTES: u64 = 1 << 31;
+
+/// Bytes of ONE projection's expert bank decoded dense f32 on the device by the
+/// composed mlx_fast_exl3_moe arm: [E, in, out] = [E, shape[1]*16, shape[2]*16].
+/// The op decodes every expert bank up front (fast.cpp exl3_moe), so this is paid
+/// whatever the router selected — 512x2560x640x4 = 3,355,443,200 B on the qwen4_exp pack.
+pub fn vkDecodedBankBytes(experts: u64, dim16_a: u64, dim16_b: u64) u64 {
+    return experts * dim16_a * 16 * dim16_b * 16 * 4;
+}
+
+/// The composed arm only fits a stream whose single-binding limit holds the decoded
+/// bank; otherwise the host plainMoeFused loop is the results contract (it decodes
+/// per selected expert, never the full table).
+pub fn vkRouteFitsBank(experts: u64, dim16_a: u64, dim16_b: u64, max_binding: u64) bool {
+    return vkDecodedBankBytes(experts, dim16_a, dim16_b) <= max_binding;
+}
+
 fn exl3VkRouteOn(s: mlx.mlx_stream) bool {
     if (std.c.getenv("SUSHI_EXL3_HOST")) |v| {
         if (std.mem.eql(u8, std.mem.span(v), "1")) return false;
@@ -3704,7 +3724,10 @@ pub fn moeSwigluClamped(
             @max(1, @divTrunc(32 * 1024 * 1024, @max(dim_n, 1))),
             @max(1, @divTrunc(65536, @max(topk, 1))),
         );
-        if (exl3VkRouteOn(s)) {
+        const gsh = mlx.getShape(gate_t);
+        // ponytail: fixed 2 GiB binding cap (Honeykrisp maxStorageBufferRange); query the
+        // device when mlxc exposes limits instead.
+        if (exl3VkRouteOn(s) and vkRouteFitsBank(@intCast(gsh[0]), @intCast(gsh[1]), @intCast(gsh[2]), VK_MAX_BINDING_BYTES)) {
             const route: VkMoeRoute = .vk;
             if (rows_n <= chunk_rows)
                 return moeSwigluOne(route, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
@@ -10359,6 +10382,13 @@ fn f64ClampedMoeReference(
             }
         }
     }
+}
+
+test "decoded expert bank sizing gates the composed vk arm" {
+    // qwen4_exp: E=512, in=2560, out=640 -> exactly the observed 3200 MiB Gather binding.
+    try std.testing.expectEqual(@as(u64, 3355443200), vkDecodedBankBytes(512, 160, 40));
+    try std.testing.expect(!vkRouteFitsBank(512, 160, 40, VK_MAX_BINDING_BYTES));
+    try std.testing.expect(vkRouteFitsBank(32, 160, 40, VK_MAX_BINDING_BYTES));
 }
 
 test "exl3 vk route matches the f64 host oracle at pack shapes" {
