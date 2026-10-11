@@ -705,9 +705,107 @@ pub const Lease = struct {
     id: u64,
 };
 
+// Handle returned by libmlx's omarchy udmabuf slab ABI (C struct
+// omarchy_udmabuf_slab): a sealed memfd exported through /dev/udmabuf as
+// a dma-buf. The mmap base is the slab the loader preads into, and the
+// omarchy Vulkan allocator imports the dma-buf so an array over the base
+// pointer aliases it (zero copy on Linux Honeykrisp, where
+// VK_EXT_external_memory_host is not advertised).
+pub const UdmabufSlab = extern struct {
+    ptr: ?*anyopaque,
+    size: usize,
+    fd: c_int,
+};
+
+const udmabuf_abi = struct {
+    var create_fn: ?*const fn (usize, *UdmabufSlab) callconv(.c) c_int = null;
+    var destroy_fn: ?*const fn (?*UdmabufSlab) callconv(.c) void = null;
+    var sync_fn: ?*const fn (?*const UdmabufSlab, c_int) callconv(.c) c_int = null;
+    var mu: std.Thread.Mutex = .{};
+    var looked = false;
+
+    extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+
+    fn sym(comptime name: [:0]const u8) ?*anyopaque {
+        return dlsym(null, name);
+    }
+
+    fn lookup() void {
+        mu.lock();
+        defer mu.unlock();
+        if (looked) return;
+        looked = true;
+        // RTLD_DEFAULT: libmlx is already loaded and linked into this
+        // process. Missing symbols (Metal build, old libmlx) leave the
+        // fns null and every caller falls back to the plain mmap path.
+        create_fn = @ptrCast(sym("omarchy_udmabuf_slab_create"));
+        destroy_fn = @ptrCast(sym("omarchy_udmabuf_slab_destroy"));
+        sync_fn = @ptrCast(sym("omarchy_udmabuf_slab_sync"));
+    }
+
+    fn lookupMissing(name: [*:0]const u8) ?*anyopaque {
+        return dlsym(null, name);
+    }
+
+    fn create(len: usize, out: *UdmabufSlab) ?c_int {
+        lookup();
+        const f = create_fn orelse return null;
+        return f(len, out);
+    }
+
+    fn destroy(h: *UdmabufSlab) void {
+        lookup();
+        if (destroy_fn) |f| {
+            f(h);
+        } else {
+            // ABI half-present: nothing safe to call; the mapping is
+            // leaked rather than corrupted.
+            h.* = .{ .ptr = null, .size = 0, .fd = -1 };
+        }
+    }
+
+    fn sync(h: *const UdmabufSlab, start: bool) void {
+        lookup();
+        if (sync_fn) |f| {
+            _ = f(h, @intFromBool(start));
+        }
+    }
+};
+
+const SlabMode = enum { udmabuf, host, device };
+
+fn parseSlabMode(v: []const u8) SlabMode {
+    if (std.mem.eql(u8, v, "host")) return .host;
+    if (std.mem.eql(u8, v, "device")) return .device;
+    return .udmabuf;
+}
+
+var slab_mode_cached = std.atomic.Value(u8).init(0);
+var udmabuf_slab_logged = std.atomic.Value(bool).init(false);
+var device_slab_note = std.atomic.Value(bool).init(false);
+
+fn slabMode() SlabMode {
+    switch (slab_mode_cached.load(.acquire)) {
+        1 => return .udmabuf,
+        2 => return .host,
+        3 => return .device,
+        else => {},
+    }
+    const mode = parseSlabMode(std.posix.getenv("SUSHI_EXPERT_SLAB") orelse "");
+    slab_mode_cached.store(switch (mode) {
+        .udmabuf => @as(u8, 1),
+        .host => @as(u8, 2),
+        .device => @as(u8, 3),
+    }, .release);
+    return mode;
+}
+
 pub const PageSlab = struct {
     allocator: std.mem.Allocator,
     bytes: []align(align_bytes) u8,
+    // Non-null when the backing is a libmlx udmabuf slab instead of the
+    // plain anonymous mmap.
+    udmabuf: ?UdmabufSlab = null,
     state: SlabState = .free,
     epoch: u64 = 0,
     next_id: u64 = 1,
@@ -716,9 +814,39 @@ pub const PageSlab = struct {
     cv: std.Io.Condition = .init,
 
     pub fn create(allocator: std.mem.Allocator, len: usize) !*PageSlab {
+        return createBacking(allocator, len, null);
+    }
+
+    // Stream-aware creation: on a non-Metal GPU stream (Linux Vulkan)
+    // the omarchy udmabuf slab is tried first so importSlab can alias
+    // it; any failure falls back to the anonymous mmap.
+    pub fn createForStream(allocator: std.mem.Allocator, len: usize, s: mlx.mlx_stream) !*PageSlab {
+        return createBacking(allocator, len, s);
+    }
+
+    fn createBacking(allocator: std.mem.Allocator, len: usize, s: ?mlx.mlx_stream) !*PageSlab {
         if (len == 0) return error.SlabEmpty;
         const slab = try allocator.create(PageSlab);
         errdefer allocator.destroy(slab);
+        if (s) |stream| {
+            switch (slabMode()) {
+                .udmabuf => if (!mlx.streamIsMetal(stream)) {
+                    if (udmabufTry(len)) |h| {
+                        const mapped: [*]align(align_bytes) u8 = @ptrCast(@alignCast(h.ptr.?));
+                        slab.* = .{ .allocator = allocator, .bytes = mapped[0..h.size], .udmabuf = h };
+                        return slab;
+                    }
+                },
+                .host => {},
+                .device => {
+                    // The device-owned backing lives on the
+                    // exl3-device-slab branch, not in this build.
+                    if (!device_slab_note.swap(true, .monotonic)) {
+                        log.info("[expert-stream] SUSHI_EXPERT_SLAB=device: device-owned backing is not in this build; using the host path\n", .{});
+                    }
+                },
+            }
+        }
         const mapped = try std.posix.mmap(
             null,
             @intCast(pageRoundUp(len)),
@@ -731,10 +859,21 @@ pub const PageSlab = struct {
         return slab;
     }
 
+    fn udmabufTry(len: usize) ?UdmabufSlab {
+        var h = UdmabufSlab{ .ptr = null, .size = 0, .fd = -1 };
+        const rc = udmabuf_abi.create(len, &h) orelse return null; // no ABI: old libmlx or Metal build
+        if (rc != 0 or h.ptr == null) return null; // kernel lacks udmabuf, size cap, ...
+        return h;
+    }
+
     pub fn destroy(self: *PageSlab) void {
         const allocator = self.allocator;
         self.live.deinit(allocator);
-        std.posix.munmap(self.bytes);
+        if (self.udmabuf) |*h| {
+            udmabuf_abi.destroy(h);
+        } else {
+            std.posix.munmap(self.bytes);
+        }
         allocator.destroy(self);
     }
 
@@ -753,6 +892,10 @@ pub const PageSlab = struct {
     }
 
     fn startFillLocked(self: *PageSlab) u64 {
+        // DMA_BUF_IOCTL_SYNC START around the CPU fill (cheap safe
+        // option; measured unnecessary on Apple UMA but correct
+        // everywhere).
+        if (self.udmabuf) |*h| udmabuf_abi.sync(h, true);
         self.state = .filling;
         self.epoch += 1;
         return self.epoch;
@@ -809,6 +952,7 @@ pub const PageSlab = struct {
         defer self.mu.unlock(io);
         switch (self.state) {
             .filling => {
+                if (self.udmabuf) |*h| udmabuf_abi.sync(h, false);
                 self.state = .ready;
                 self.cv.broadcast(io);
                 return self.epoch;
@@ -981,7 +1125,11 @@ pub fn importSlab(
     const needed = elements * try dtypeBytes(dtype);
     if (needed > slab.bytes.len) return error.ImportShapeMismatch;
     payload.epoch = slab.currentEpoch();
-    return importHostBytes(slab.bytes[0..needed], shape, dtype, payload, opts);
+    const operand = try importHostBytes(slab.bytes[0..needed], shape, dtype, payload, opts);
+    if (operand.aliased and slab.udmabuf != null and !udmabuf_slab_logged.swap(true, .acq_rel)) {
+        log.info("[expert-stream] udmabuf slab: {d} MB, dma-buf imported\n", .{slab.udmabuf.?.size / (1024 * 1024)});
+    }
+    return operand;
 }
 
 const TestFile = struct {
@@ -1856,4 +2004,28 @@ test "expert io import active memory counts an aliased slab once" {
     errdefer benchPrint("[expert-io] aliased import active memory delta {d} for {d} bytes\n", .{ delta, bytes });
     try t.expect(operand.aliased);
     try t.expect(delta < 2 * bytes);
+}
+
+test "udmabuf abi lookup misses cleanly for unknown symbols" {
+    const t = std.testing;
+    // An old libmlx or a Metal build has no omarchy_ symbols: dlsym
+    // returns null and every caller falls back to the plain mmap path.
+    try t.expect(udmabuf_abi.lookupMissing("omarchy_udmabuf_slab_missing") == null);
+}
+
+test "udmabuf slab handle layout matches the C ABI" {
+    const t = std.testing;
+    // extern struct: ptr, size, int fd, padded. The libmlx side defines
+    // the same shape; a layout drift would corrupt every call.
+    try t.expectEqual(@sizeOf(usize) * 2 + 4, @sizeOf(UdmabufSlab));
+    try t.expectEqual(@sizeOf(usize), @offsetOf(UdmabufSlab, "size"));
+}
+
+test "slab mode parses SUSHI_EXPERT_SLAB values" {
+    const t = std.testing;
+    try t.expect(parseSlabMode("") == .udmabuf);
+    try t.expect(parseSlabMode("udmabuf") == .udmabuf);
+    try t.expect(parseSlabMode("host") == .host);
+    try t.expect(parseSlabMode("device") == .device);
+    try t.expect(parseSlabMode("nonsense") == .udmabuf);
 }

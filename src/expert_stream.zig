@@ -970,15 +970,15 @@ const SlabOperand = struct {
         return .{ .stride = 0, .count = 0 };
     }
 
-    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32) !SlabOperand {
-        return createTyped(allocator, count, d0, d1, .bfloat16, 2);
+    fn create(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, s: mlx.mlx_stream) !SlabOperand {
+        return createTyped(allocator, count, d0, d1, .bfloat16, 2, s);
     }
 
-    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes, s);
     }
 
-    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8, s: mlx.mlx_stream) !SlabOperand {
         if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
         var stride: usize = elem_bytes;
         var shape: [4]c_int = undefined;
@@ -988,7 +988,12 @@ const SlabOperand = struct {
             stride = try std.math.mul(usize, stride, @intCast(d));
             shape[j + 1] = d;
         }
-        const slab = try io_mod.PageSlab.create(allocator, stride * count);
+        // The stream decides the backing: a non-Metal GPU stream tries
+        // the omarchy udmabuf slab first so the import aliases (zero
+        // copy on Linux Honeykrisp); everything else takes the plain
+        // mmap, whose host-import copy fallback aborts slab-set
+        // creation on that backend.
+        const slab = try io_mod.PageSlab.createForStream(allocator, stride * count, s);
         errdefer slab.destroy();
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
@@ -1224,11 +1229,11 @@ fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, laye
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
         else if (spec.exl3 and spec.packed_n != 0)
-            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes, s)
         else if (spec.exl3)
-            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes, s)
         else
-            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
+            try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes, s);
     }
     return slabs;
 }
