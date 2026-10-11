@@ -10404,7 +10404,7 @@ test "exl3 vk route matches the f64 host oracle at pack shapes" {
             defer _ = mlx.mlx_array_free(got);
             // The route engaged: the composed op accepted the call (a
             // silent fallback to plainMoeFused would not advance the
-            // counter — the op error path logs and takes the host loop).
+            // counter; the op error path logs and takes the host loop).
             try std.testing.expect(vk_route_calls > calls0);
             try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got)[0])));
             try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got)[1]);
