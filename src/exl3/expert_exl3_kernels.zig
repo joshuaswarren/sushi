@@ -3551,9 +3551,6 @@ pub var vk_route_calls: usize = 0;
 
 var vk_fallback_logged = std.atomic.Value(bool).init(false);
 
-/// The non-Metal GPU route is on by default; SUSHI_EXL3_HOST=1 forces the
-/// host plainMoeFused loop. The composed primitive implements the MCG
-/// codebook (every current pack), so other codebooks stay on the host.
 /// Largest single storage-buffer binding the non-Metal device accepts. Honeykrisp
 /// reports maxStorageBufferRange 2 GiB (jw16 serve.log 2026-10-11); a bigger one-binding
 /// array dies in Gather before allocation is even attempted.
@@ -3574,6 +3571,18 @@ pub fn vkRouteFitsBank(experts: u64, dim16_a: u64, dim16_b: u64, max_binding: u6
     return vkDecodedBankBytes(experts, dim16_a, dim16_b) <= max_binding;
 }
 
+/// `SUSHI_EXL3_VK_BANKGATE=0` bypasses the decoded-bank fit check so the composed
+/// op is called even when one projection's decoded bank exceeds one device binding —
+/// for arms that only touch selected experts (the fused vk arm) the oversized bank
+/// is never materialized. Default: gate on.
+pub fn vkBankGateOn() bool {
+    const v = std.c.getenv("SUSHI_EXL3_VK_BANKGATE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+/// The non-Metal GPU route is on by default; SUSHI_EXL3_HOST=1 forces the
+/// host plainMoeFused loop. The composed primitive implements the MCG
+/// codebook (every current pack), so other codebooks stay on the host.
 fn exl3VkRouteOn(s: mlx.mlx_stream) bool {
     if (std.c.getenv("SUSHI_EXL3_HOST")) |v| {
         if (std.mem.eql(u8, std.mem.span(v), "1")) return false;
@@ -3726,8 +3735,9 @@ pub fn moeSwigluClamped(
         );
         const gsh = mlx.getShape(gate_t);
         // ponytail: fixed 2 GiB binding cap (Honeykrisp maxStorageBufferRange); query the
-        // device when mlxc exposes limits instead.
-        if (exl3VkRouteOn(s) and vkRouteFitsBank(@intCast(gsh[0]), @intCast(gsh[1]), @intCast(gsh[2]), VK_MAX_BINDING_BYTES)) {
+        // device when mlxc exposes limits instead. SUSHI_EXL3_VK_BANKGATE=0 bypasses the
+        // fit check for arms that never materialize the full bank.
+        if (exl3VkRouteOn(s) and (vkRouteFitsBank(@intCast(gsh[0]), @intCast(gsh[1]), @intCast(gsh[2]), VK_MAX_BINDING_BYTES) or !vkBankGateOn())) {
             const route: VkMoeRoute = .vk;
             if (rows_n <= chunk_rows)
                 return moeSwigluOne(route, s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, dim_n, inter_n, topk, limit, out_dtype);
@@ -10389,6 +10399,12 @@ test "decoded expert bank sizing gates the composed vk arm" {
     try std.testing.expectEqual(@as(u64, 3355443200), vkDecodedBankBytes(512, 160, 40));
     try std.testing.expect(!vkRouteFitsBank(512, 160, 40, VK_MAX_BINDING_BYTES));
     try std.testing.expect(vkRouteFitsBank(32, 160, 40, VK_MAX_BINDING_BYTES));
+
+    // SUSHI_EXL3_VK_BANKGATE=0 lets an oversized bank through (fused-arm bypass).
+    try std.testing.expect(vkBankGateOn());
+    _ = setenv("SUSHI_EXL3_VK_BANKGATE", "0", 1);
+    defer _ = unsetenv("SUSHI_EXL3_VK_BANKGATE");
+    try std.testing.expect(!vkBankGateOn());
 }
 
 test "exl3 vk route matches the f64 host oracle at pack shapes" {
