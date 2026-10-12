@@ -10501,12 +10501,15 @@ test "exl3 vk route E512 streamed cache" {
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     // The CT harness runs the recorded stock-Mesa lavapipe shim
     // (MLX_OMARCHY_ALLOW_NON_APPLE=1), where the decode kernel class
-    // miscompiles (m3a receipt): engagement-only there, numbers on the
-    // device, same split as the pack-shapes test above.
-    const ct_shim = if (std.c.getenv("MLX_OMARCHY_ALLOW_NON_APPLE")) |v|
-        std.mem.eql(u8, std.mem.span(v), "1")
-    else
-        false;
+    // miscompiles (m3a receipt) AND the 200 MB trellis banks exceed the
+    // 128 MiB llvmpipe storage range, so the op can neither engage nor
+    // produce numbers there: the E512 gate is device-only.
+    if (std.c.getenv("MLX_OMARCHY_ALLOW_NON_APPLE")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "1")) {
+            std.debug.print("exl3 vk route E512: skipped (lavapipe shim cannot bind or run the 512-slot banks)\n", .{});
+            return error.SkipZigTest;
+        }
+    }
 
     // The decoded-bank gate would decline the route (3.35 GB decoded bank
     // > 2 GiB binding); the fused arm never materializes the bank, so the
@@ -10586,37 +10589,33 @@ test "exl3 vk route E512 streamed cache" {
             try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got)[0])));
             try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got)[1]);
             try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
-            if (ct_shim) {
-                std.debug.print("exl3 vk route E512 rows={d} limit={d}: engagement-only (recorded lavapipe shim miscompile)\n", .{ rows, limit });
-            } else {
-                const ref = if (limit == 0) ref0 else ref10;
-                var got32 = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(got32);
-                try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
-                try mlx.check(mlx.mlx_array_eval(got32));
-                const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
-                var worst: f64 = 0;
-                var worst_i: usize = 0;
-                for (0..rows * 2560) |i| {
-                    const diff = @abs(@as(f64, g[i]) - ref[i]);
-                    const tol = 0.02 + 0.01 * @abs(ref[i]);
-                    if (diff > tol) {
-                        // Fail loudly: worst-class element, both values, and the
-                        // row's full expert id list (output columns mix all topk
-                        // slots of the row, so the list is the suspect set).
-                        const r = i / 2560;
-                        std.debug.print("exl3 vk route E512 DIVERGENCE rows={d} limit={d}: element r={d} o={d} got={d} ref={d} diff={d} tol={d} row_experts=", .{ rows, limit, r, i % 2560, g[i], ref[i], diff, tol });
-                        for (0..10) |k| std.debug.print("{d},", .{f.slots[r * 10 + k]});
-                        std.debug.print("\n", .{});
-                        return error.VkRouteE512Diverged;
-                    }
-                    if (diff > worst) {
-                        worst = diff;
-                        worst_i = i;
-                    }
+            const ref = if (limit == 0) ref0 else ref10;
+            var got32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(got32);
+            try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(got32));
+            const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
+            var worst: f64 = 0;
+            var worst_i: usize = 0;
+            for (0..rows * 2560) |i| {
+                const diff = @abs(@as(f64, g[i]) - ref[i]);
+                const tol = 0.02 + 0.01 * @abs(ref[i]);
+                if (diff > tol) {
+                    // Fail loudly: worst-class element, both values, and the
+                    // row's full expert id list (output columns mix all topk
+                    // slots of the row, so the list is the suspect set).
+                    const r = i / 2560;
+                    std.debug.print("exl3 vk route E512 DIVERGENCE rows={d} limit={d}: element r={d} o={d} got={d} ref={d} diff={d} tol={d} row_experts=", .{ rows, limit, r, i % 2560, g[i], ref[i], diff, tol });
+                    for (0..10) |k| std.debug.print("{d},", .{f.slots[r * 10 + k]});
+                    std.debug.print("\n", .{});
+                    return error.VkRouteE512Diverged;
                 }
-                std.debug.print("exl3 vk route E512 rows={d} limit={d}: worst |diff| {d:.6} at r={d} o={d} (row experts {d},{d},...)\n", .{ rows, limit, worst, worst_i / 2560, worst_i % 2560, f.slots[(worst_i / 2560) * 10], f.slots[(worst_i / 2560) * 10 + 1] });
+                if (diff > worst) {
+                    worst = diff;
+                    worst_i = i;
+                }
             }
+            std.debug.print("exl3 vk route E512 rows={d} limit={d}: worst |diff| {d:.6} at r={d} o={d} (row experts {d},{d},...)\n", .{ rows, limit, worst, worst_i / 2560, worst_i % 2560, f.slots[(worst_i / 2560) * 10], f.slots[(worst_i / 2560) * 10 + 1] });
         }
     }
 }
