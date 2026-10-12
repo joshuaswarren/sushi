@@ -949,6 +949,18 @@ fn logitsVocab(logits: mlx.mlx_array) !usize {
     return @intCast(shape[2]);
 }
 
+fn kldTraceEnabled() bool {
+    const raw = std.c.getenv("SUSHI_KLD_TRACE") orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+}
+
+fn kldTracePhase(io: std.Io, started: std.Io.Timestamp, row: usize, phase: []const u8) void {
+    if (!kldTraceEnabled()) return;
+    std.debug.print("[kld-phase] row={d} phase={s} elapsed_ms={d}\n", .{
+        row, phase, @divTrunc(started.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms),
+    });
+}
+
 fn readLastRow(xfm: *transformer_mod.Transformer, logits: mlx.mlx_array, dst: []f32) !void {
     const shape = mlx.getShape(logits);
     if (shape.len != 3 or @as(usize, @intCast(shape[2])) != dst.len) return error.KldLogitsShape;
@@ -968,7 +980,9 @@ fn readLastRow(xfm: *transformer_mod.Transformer, logits: mlx.mlx_array, dst: []
     var contiguous = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(contiguous);
     try mlx.check(mlx.mlx_contiguous(&contiguous, row_f32, false, xfm.s));
+    if (kldTraceEnabled()) std.debug.print("[kld-phase] phase=logits_eval_start\n", .{});
     try mlx.check(mlx.mlx_array_eval(contiguous));
+    if (kldTraceEnabled()) std.debug.print("[kld-phase] phase=logits_eval_done\n", .{});
     const data = mlx.mlx_array_data_float32(contiguous) orelse return error.KldLogitsUnreadable;
     @memcpy(dst, data[0..dst.len]);
 }
@@ -1297,7 +1311,10 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         defer allocator.free(model_row);
 
         var ctx = l.xfm.defaultCtx();
+        const trace_started = std.Io.Timestamp.now(io, .awake);
+        kldTracePhase(io, trace_started, 0, "prefill_start");
         var logits = try forwardPrompt(allocator, l, &ctx, prompt_ids);
+        kldTracePhase(io, trace_started, 0, "prefill_built");
         defer _ = mlx.mlx_array_free(logits);
 
         var prompt_kld: f64 = 0;
@@ -1316,14 +1333,22 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         var top1_eos: usize = 0;
         const per_pos = try allocator.alloc(f64, generated.len);
         for (generated, 0..) |token, position| {
+            kldTracePhase(io, trace_started, position, "teacher_read_start");
             try expert_stream_mod.readExact(teacher_fd, std.mem.sliceAsBytes(teacher_row), position * vocab * @sizeOf(f32));
+            kldTracePhase(io, trace_started, position, "teacher_read_done");
             if (position > 0) {
+                kldTracePhase(io, trace_started, position, "decode_build_start");
                 const next = try forwardOne(l, &ctx, generated[position - 1]);
+                kldTracePhase(io, trace_started, position, "decode_built");
                 _ = mlx.mlx_array_free(logits);
                 logits = next;
             }
+            kldTracePhase(io, trace_started, position, "logits_read_start");
             try readLastRow(&l.xfm, logits, model_row);
+            kldTracePhase(io, trace_started, position, "logits_read_done");
             const score = try scoreRow(teacher_row, model_row, token);
+            if (kldTraceEnabled()) std.debug.print("[kld-row] row={d} kld={d:.9} top1={any} nll={d:.9}\n", .{ position, score.kld, score.top1, score.nll });
+            kldTracePhase(io, trace_started, position, "score_done");
             prompt_kld += score.kld;
             prompt_nll += score.nll;
             prompt_cosine_similarity += score.cosine_similarity;
