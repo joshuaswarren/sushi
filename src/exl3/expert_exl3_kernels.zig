@@ -10304,6 +10304,8 @@ fn bf16RneBits(v: f32) u16 {
 /// the in-tree reference decoder (the same reconstructPublic the decode
 /// isolation gate pins bit-exact against the shipped kernel) and run the
 /// clamped routed MoE in f64. No custom kernels, so it runs on any stream.
+/// `selected` (all-true when null) skips experts the routing never picks,
+/// so a 512-slot bank costs only the selected decodes.
 fn f64ClampedMoeReference(
     alloc: std.mem.Allocator,
     f: *const MimoMoeFixture,
@@ -10315,6 +10317,7 @@ fn f64ClampedMoeReference(
     rate: exl3.Rate,
     dec: exl3.Decode,
     limit: c_int,
+    selected: ?[]const bool,
     out: []f64,
 ) !void {
     const n = rate.halfwords();
@@ -10330,6 +10333,7 @@ fn f64ClampedMoeReference(
     const act = try alloc.alloc(f64, c_inter);
     defer alloc.free(act);
     for (0..e) |ef| {
+        if (selected) |sel| if (!sel[ef]) continue;
         try exl3.reconstructPublic(
             alloc,
             f.gate_t[ef * gu_tile ..][0..gu_tile],
@@ -10465,7 +10469,7 @@ test "exl3 vk route matches the f64 host oracle at pack shapes" {
                 // composed path's f32 matmul accumulation plus the bf16
                 // output rounding (ulp ~ 0.004*|v|).
                 const ref = try alloc.alloc(f64, rows * 2560);
-                try f64ClampedMoeReference(alloc, &f, 2560, 640, 16, rows, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, limit, ref);
+                try f64ClampedMoeReference(alloc, &f, 2560, 640, 16, rows, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, limit, null, ref);
                 var got32 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(got32);
                 try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
@@ -10479,6 +10483,139 @@ test "exl3 vk route matches the f64 host oracle at pack shapes" {
                     worst = @max(worst, @as(f32, @floatCast(diff)));
                 }
                 std.debug.print("exl3 vk route rows={d} limit={d}: worst |diff| {d:.6}\n", .{ rows, limit, worst });
+            }
+        }
+    }
+}
+
+test "exl3 vk route E512 streamed cache" {
+    // The qwen4_exp MoE bank shape: E=512 trellis slots over hidden 2560,
+    // inter 640, topk 10, the streamed-cache bank the fused vk arm serves
+    // from the 65 GB pack. The composed arm cannot serve this shape (one
+    // decoded f32 bank is 3.35 GB, past the 2 GiB single binding), and the
+    // arm was only ever exercised at E=32, so a passing oracle comparison
+    // here is the E=512 gate its addressing never had: slots cross the
+    // 255/256 boundary and reach the 509..511 top of the id range.
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The CT harness runs the recorded stock-Mesa lavapipe shim
+    // (MLX_OMARCHY_ALLOW_NON_APPLE=1), where the decode kernel class
+    // miscompiles (m3a receipt): engagement-only there, numbers on the
+    // device, same split as the pack-shapes test above.
+    const ct_shim = if (std.c.getenv("MLX_OMARCHY_ALLOW_NON_APPLE")) |v|
+        std.mem.eql(u8, std.mem.span(v), "1")
+    else
+        false;
+
+    // The decoded-bank gate would decline the route (3.35 GB decoded bank
+    // > 2 GiB binding); the fused arm never materializes the bank, so the
+    // test bypasses the gate exactly like the serve path.
+    try std.testing.expect(vkBankGateOn());
+    _ = setenv("SUSHI_EXL3_VK_BANKGATE", "0", 1);
+    defer _ = unsetenv("SUSHI_EXL3_VK_BANKGATE");
+    setDecodeParams(.{ .codebook = .mcg, .window = .w15 });
+    defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var f = try mimoMoeFixture(alloc, .{
+        .e = 512,
+        .hidden = 2560,
+        .inter = 640,
+        .topk = 10,
+        .rows = 5,
+        .rate = .{ .n = 32 },
+        .dec = .{ .codebook = .mcg, .window = .w15 },
+        .seed = 51207,
+        .x_scale = 8,
+    });
+    // Routing over the FULL 0..511 id range: every row keeps its topk slots
+    // distinct, the 8-bit neighbourhoods all appear (0, 1, 2, 3, 7, 33, 44,
+    // 64, 88, 96, 128, 130, 191, 222, 254, 255, 256, 257, 300, 333, 383,
+    // 384, 399, 401, 415, 470, 508, 509, 510, 511), expert ids > 255 ride
+    // every row, and 0/255/256/511 repeat across rows so shared decodes and
+    // the e >= 2^8 addressing are both exercised.
+    const routed = [5][10]u32{
+        .{ 0, 1, 2, 255, 256, 257, 300, 509, 510, 511 },
+        .{ 511, 256, 255, 0, 1, 128, 384, 333, 64, 222 },
+        .{ 130, 256, 511, 7, 44, 255, 399, 88, 470, 22 },
+        .{ 256, 64, 130, 510, 191, 383, 511, 0, 96, 415 },
+        .{ 509, 508, 511, 3, 254, 257, 130, 401, 33, 510 },
+    };
+    for (routed, 0..) |row, r| {
+        for (row, 0..) |slot, k| {
+            for (row[0..k]) |prev| try std.testing.expect(prev != slot);
+            f.slots[r * 10 + k] = slot;
+        }
+    }
+    // The fixture baked its random routing into the mlx array; rebind the
+    // slots array to the boundary routing the oracle reads below.
+    _ = mlx.mlx_array_free(f.arrays[7]);
+    f.arrays[7] = mlx.mlx_array_new_data(f.slots.ptr, &[_]c_int{50}, 1, .uint32);
+
+    var selected: [512]bool = @splat(false);
+    for (f.slots) |slot| selected[slot] = true;
+    // One oracle pass per clamp limit over all five rows; each pass decodes
+    // only the distinct selected experts, never the 512-expert bank.
+    const ref0 = try alloc.alloc(f64, 5 * 2560);
+    const ref10 = try alloc.alloc(f64, 5 * 2560);
+    try f64ClampedMoeReference(alloc, &f, 2560, 640, 512, 5, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, 0, &selected, ref0);
+    try f64ClampedMoeReference(alloc, &f, 2560, 640, 512, 5, 10, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w15 }, 10, &selected, ref10);
+
+    var x_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_bf);
+    try mlx.check(mlx.mlx_astype(&x_bf, f.arrays[8], .bfloat16, s));
+    inline for (.{ 1, 2, 3, 5 }) |rows| {
+        inline for (.{ 10, 0 }) |limit| {
+            const xc = try sliceRows(x_bf, 0, rows, s);
+            defer _ = mlx.mlx_array_free(xc);
+            const slc = try sliceRows(f.arrays[7], 0, @intCast(rows * 10), s);
+            defer _ = mlx.mlx_array_free(slc);
+            const scc = try sliceRows(f.arrays[9], 0, @intCast(rows * 10), s);
+            defer _ = mlx.mlx_array_free(scc);
+            const calls0 = vk_route_calls;
+            const got = try moeSwigluClamped(s, xc, f.arrays[0], f.arrays[3], f.arrays[4], f.arrays[1], f.arrays[3], f.arrays[4], f.arrays[2], f.arrays[5], f.arrays[6], slc, scc, 10, limit, .bfloat16);
+            defer _ = mlx.mlx_array_free(got);
+            // The route engaged: the composed op cannot serve this bank (its
+            // decode dies on the binding limit), so a silent host fallback
+            // leaves the counter unmoved; the ticket log's MLX_OMARCHY_EXL3
+            // "fused arm dispatched" lines are the per-dispatch arm proof.
+            try std.testing.expect(vk_route_calls > calls0);
+            try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got)[0])));
+            try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got)[1]);
+            try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+            if (ct_shim) {
+                std.debug.print("exl3 vk route E512 rows={d} limit={d}: engagement-only (recorded lavapipe shim miscompile)\n", .{ rows, limit });
+            } else {
+                const ref = if (limit == 0) ref0 else ref10;
+                var got32 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got32);
+                try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(got32));
+                const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
+                var worst: f64 = 0;
+                var worst_i: usize = 0;
+                for (0..rows * 2560) |i| {
+                    const diff = @abs(@as(f64, g[i]) - ref[i]);
+                    const tol = 0.02 + 0.01 * @abs(ref[i]);
+                    if (diff > tol) {
+                        // Fail loudly: worst-class element, both values, and the
+                        // row's full expert id list (output columns mix all topk
+                        // slots of the row, so the list is the suspect set).
+                        const r = i / 2560;
+                        std.debug.print("exl3 vk route E512 DIVERGENCE rows={d} limit={d}: element r={d} o={d} got={d} ref={d} diff={d} tol={d} row_experts=", .{ rows, limit, r, i % 2560, g[i], ref[i], diff, tol });
+                        for (0..10) |k| std.debug.print("{d},", .{f.slots[r * 10 + k]});
+                        std.debug.print("\n", .{});
+                        return error.VkRouteE512Diverged;
+                    }
+                    if (diff > worst) {
+                        worst = diff;
+                        worst_i = i;
+                    }
+                }
+                std.debug.print("exl3 vk route E512 rows={d} limit={d}: worst |diff| {d:.6} at r={d} o={d} (row experts {d},{d},...)\n", .{ rows, limit, worst, worst_i / 2560, worst_i % 2560, f.slots[(worst_i / 2560) * 10], f.slots[(worst_i / 2560) * 10 + 1] });
             }
         }
     }
