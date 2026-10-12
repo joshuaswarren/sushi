@@ -20267,6 +20267,13 @@ pub const Transformer = struct {
 
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
+        if (finiteTracePending()) return self.forwardWithFiniteTrace(ctx, token_ids);
+        return self.forwardDispatch(ctx, token_ids);
+    }
+
+    /// The arch dispatch chain shared by every forward. Mirrored by
+    /// `finiteTracePathName` and `finiteTraceCaptures` below, IN ORDER.
+    fn forwardDispatch(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.glm5) |mdl| return forwardGlm5WithImpl(self, ctx, token_ids, mdl);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
@@ -20278,6 +20285,179 @@ pub const Transformer = struct {
         if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
         return self.forwardStandardWith(ctx, token_ids);
     }
+
+    /// SUSHI_FINITE_TRACE=N: for the first N forwards (prefill chunks and
+    /// decode steps both count) check the trunk's per-layer residual and the
+    /// logits for non-finite values, logging the first forward and layer
+    /// where they appear. Zero behavior change when unset or 0. Logs only on
+    /// detection plus one armed and one done line per trace.
+    /// ponytail: localization stops at layer boundaries (the CaptureLayers
+    /// granularity); per-op capture (capture_hidden_all) is the upgrade if a
+    /// bad layer ever needs splitting into attention vs MLP.
+    fn forwardWithFiniteTrace(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        finite_trace_left -= 1;
+        finite_trace_ordinal += 1;
+        const fwd = finite_trace_ordinal;
+        // Reuse the DFlash layer-capture plumbing; never fight a caller that
+        // owns it (dflash/kld). Only paths that FILL `CaptureLayers.out`:
+        // standard/qwen4/moe/hybrid (glm5 and dsv4 ignore it silently).
+        const want_capture = ctx.capture_layers == null and finiteTraceCaptures(self);
+        var input_arr = mlx.mlx_array_new();
+        var cl = CaptureLayers{ .ids = &.{}, .out = &.{} };
+        var ids: []u32 = &.{};
+        var outs: []mlx.mlx_array = &.{};
+        if (want_capture) {
+            self.finiteTraceInstall(&cl, &ids, &outs, &input_arr);
+            if (cl.out.len > 0) ctx.capture_layers = &cl;
+        }
+        defer {
+            if (cl.out.len > 0) ctx.capture_layers = null;
+            for (outs) |a| _ = mlx.mlx_array_free(a);
+            if (outs.len > 0) self.allocator.free(outs);
+            if (ids.len > 0) self.allocator.free(ids);
+            _ = mlx.mlx_array_free(input_arr);
+        }
+        if (fwd == 1) {
+            log.info("[finite] armed n={d} path={s} layers={d}\n", .{ finite_trace_budget, finiteTracePathName(self), cl.out.len });
+        }
+        const logits = try self.forwardDispatch(ctx, token_ids);
+        var first_bad: ?FiniteFirst = null;
+        var filled: usize = 0;
+        for (cl.out, 0..) |h, li| {
+            if (mlx.mlx_array_size(h) == 0) continue;
+            filled += 1;
+            if (finiteTraceCheckArray(self, h, fwd, li, cl.out.len)) {
+                if (first_bad == null) first_bad = .{ .fwd = fwd, .layer = li };
+            }
+        }
+        if (want_capture and filled == 0) {
+            // The path ignored capture_layers (batched arm, chunked shape):
+            // say so once, keep the logits check.
+            log.info("[finite] fwd={d} layer capture came back empty; logits only\n", .{fwd});
+        }
+        if (finiteTraceCheckArray(self, logits, fwd, null, 0)) {
+            if (first_bad == null) first_bad = .{ .fwd = fwd, .layer = null };
+        }
+        if (first_bad != null) finite_trace_bad_fwds += 1;
+        if (finite_trace_first == null) finite_trace_first = first_bad;
+        if (finite_trace_left == 0) {
+            if (finite_trace_first) |fb| {
+                if (fb.layer) |l| {
+                    log.info("[finite] done forwards={d} bad_forwards={d} first_bad=fwd{d} layer{d}\n", .{ finite_trace_ordinal, finite_trace_bad_fwds, fb.fwd, l });
+                } else {
+                    log.info("[finite] done forwards={d} bad_forwards={d} first_bad=fwd{d} logits\n", .{ finite_trace_ordinal, finite_trace_bad_fwds, fb.fwd });
+                }
+            } else {
+                log.info("[finite] done forwards={d} bad_forwards=0\n", .{finite_trace_ordinal});
+            }
+        }
+        return logits;
+    }
+
+    fn finiteTraceInstall(self: *Transformer, cl: *CaptureLayers, ids: *[]u32, outs: *[]mlx.mlx_array, input: *mlx.mlx_array) void {
+        const n = self.config.num_hidden_layers;
+        ids.* = self.allocator.alloc(u32, n) catch return;
+        outs.* = self.allocator.alloc(mlx.mlx_array, n) catch {
+            self.allocator.free(ids.*);
+            ids.* = &.{};
+            return;
+        };
+        for (0..n) |i| {
+            ids.*[i] = @intCast(i);
+            outs.*[i] = mlx.mlx_array_new();
+        }
+        cl.* = .{ .ids = ids.*, .out = outs.*, .input = input };
+    }
+
+    const FiniteFirst = struct { fwd: u64, layer: ?usize };
+    const FiniteStats = struct { bad: usize = 0, first: usize = 0, min: f32 = 0, max: f32 = 0 };
+
+    /// `SUSHI_FINITE_TRACE` parsed once: absent, 0 or garbage = off.
+    fn finiteTraceParse(raw: ?[*:0]const u8) u32 {
+        const r = raw orelse return 0;
+        return std.fmt.parseInt(u32, std.mem.span(r), 10) catch 0;
+    }
+
+    fn finiteTracePending() bool {
+        if (!finite_trace_parsed) {
+            finite_trace_parsed = true;
+            finite_trace_budget = finiteTraceParse(std.c.getenv("SUSHI_FINITE_TRACE"));
+            finite_trace_left = finite_trace_budget;
+        }
+        return finite_trace_left > 0;
+    }
+
+    /// Mirrors `forwardDispatch` IN ORDER. Only the armed log line names the
+    /// value; it never drives behavior.
+    fn finiteTracePathName(self: *const Transformer) []const u8 {
+        if (self.dsv4 != null) return "dsv4";
+        if (self.glm5 != null) return "glm5";
+        if (self.bert_layers != null) return "bert";
+        if (self.config.use_bidirectional_attention) return "encoder";
+        if (self.hybrid_layers != null) return "hybrid";
+        if (self.qwen4 != null) return "qwen4";
+        if (self.moe_layers != null) return "moe";
+        return "standard";
+    }
+
+    /// Paths whose forward FILLS `CaptureLayers.out` (glm5/dsv4 ignore it
+    /// silently, so installing there would check nothing).
+    fn finiteTraceCaptures(self: *const Transformer) bool {
+        const p = self.finiteTracePathName();
+        for (.{ "standard", "qwen4", "moe", "hybrid" }) |name| {
+            if (std.mem.eql(u8, p, name)) return true;
+        }
+        return false;
+    }
+
+    /// Host scan of one tensor (already f32): NaN/Inf count, first flat
+    /// index, extrema over the FINITE entries only. Pure — testable without mlx.
+    fn finiteScanStats(src: []const f32) FiniteStats {
+        var st = FiniteStats{ .min = std.math.floatMax(f32), .max = -std.math.floatMax(f32) };
+        for (src, 0..) |v, i| {
+            if (std.math.isFinite(v)) {
+                if (v < st.min) st.min = v;
+                if (v > st.max) st.max = v;
+            } else {
+                if (st.bad == 0) st.first = i;
+                st.bad += 1;
+            }
+        }
+        if (st.bad == src.len) {
+            st.min = 0;
+            st.max = 0;
+        }
+        return st;
+    }
+
+    /// Eval one array through an f32 copy and log it when any entry is not
+    /// finite. Never errors: an mlx failure just skips the check.
+    fn finiteTraceCheckArray(self: *Transformer, arr: mlx.mlx_array, fwd: u64, layer: ?usize, n_layers: usize) bool {
+        var contig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(contig);
+        if (mlx.mlx_contiguous(&contig, arr, false, self.s) != 0) return false;
+        var wide = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wide);
+        if (mlx.mlx_astype(&wide, contig, .float32, self.s) != 0) return false;
+        if (mlx.mlx_array_eval(wide) != 0) return false;
+        const n = mlx.mlx_array_size(wide);
+        const src = mlx.mlx_array_data_float32(wide) orelse return false;
+        const st = finiteScanStats(src[0..n]);
+        if (st.bad == 0) return false;
+        if (layer) |li| {
+            log.info("[finite] fwd={d} layer={d}/{d} nonfinite={d}/{d} first={d} min={d} max={d}\n", .{ fwd, li, n_layers, st.bad, n, st.first, st.min, st.max });
+        } else {
+            log.info("[finite] fwd={d} logits nonfinite={d}/{d} first={d} min={d} max={d}\n", .{ fwd, st.bad, n, st.first, st.min, st.max });
+        }
+        return true;
+    }
+
+    var finite_trace_parsed: bool = false;
+    var finite_trace_budget: u32 = 0;
+    var finite_trace_left: u32 = 0;
+    var finite_trace_ordinal: u64 = 0;
+    var finite_trace_bad_fwds: u32 = 0;
+    var finite_trace_first: ?FiniteFirst = null;
 
     /// Does `forwardWith` route this model through `forwardStandardWith`?
     /// Mirrors the dispatch chain above IN ORDER.
@@ -77146,4 +77326,30 @@ test "GLM vision native serving splices media before HC expansion and preserves 
         try testing.expectEqualSlices(c_int, &.{ 1, 1, 128 }, mlx.getShape(capture_out[0]));
         try testing.expectEqual(request.offset, ctx.cache.step);
     }
+}
+
+test "finite trace scan stats: counts, first index, finite extrema" {
+    const T = Transformer;
+    const all_ok = T.finiteScanStats(&.{ -1.5, 0.25, 3.0 });
+    try testing.expectEqual(@as(usize, 0), all_ok.bad);
+    try testing.expectEqual(@as(f32, -1.5), all_ok.min);
+    try testing.expectEqual(@as(f32, 3.0), all_ok.max);
+    const mixed = T.finiteScanStats(&.{ 1.0, std.math.nan(f32), -8.0, std.math.inf(f32), 2.0 });
+    try testing.expectEqual(@as(usize, 2), mixed.bad);
+    try testing.expectEqual(@as(usize, 1), mixed.first);
+    try testing.expectEqual(@as(f32, -8.0), mixed.min);
+    try testing.expectEqual(@as(f32, 2.0), mixed.max);
+    const all_bad = T.finiteScanStats(&.{ std.math.nan(f32), std.math.inf(f32) });
+    try testing.expectEqual(@as(usize, 2), all_bad.bad);
+    try testing.expectEqual(@as(f32, 0), all_bad.min);
+    try testing.expectEqual(@as(f32, 0), all_bad.max);
+}
+
+test "finite trace budget parse: absent, zero, garbage, value, overflow" {
+    const T = Transformer;
+    try testing.expectEqual(@as(u32, 0), T.finiteTraceParse(null));
+    try testing.expectEqual(@as(u32, 0), T.finiteTraceParse("0"));
+    try testing.expectEqual(@as(u32, 0), T.finiteTraceParse("yes"));
+    try testing.expectEqual(@as(u32, 40), T.finiteTraceParse("40"));
+    try testing.expectEqual(@as(u32, 0), T.finiteTraceParse("4294967296"));
 }
