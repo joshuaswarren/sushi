@@ -10493,9 +10493,18 @@ test "exl3 vk route E512 streamed cache" {
     // inter 640, topk 10, the streamed-cache bank the fused vk arm serves
     // from the 65 GB pack. The composed arm cannot serve this shape (one
     // decoded f32 bank is 3.35 GB, past the 2 GiB single binding), and the
-    // arm was only ever exercised at E=32, so a passing oracle comparison
-    // here is the E=512 gate its addressing never had: slots cross the
-    // 255/256 boundary and reach the 509..511 top of the id range.
+    // arm was only ever exercised at E=32, so this is the E=512 gate its
+    // addressing never had: slots cross the 255/256 boundary and reach the
+    // 509..511 top of the id range.
+    //
+    // The gate is fused vs fused: every sub-run gathers the same selected
+    // experts into an E=32 control bank (rank ids), keeps x, scores and
+    // limit identical, and requires bit-for-bit equal bf16 output, so a
+    // failure isolates E-dependence or slot-id dependence (id wrap at 256,
+    // bank offset math, binding size) from arithmetic noise. The f64 oracle
+    // comparison is INFORMATIONAL: random trellis banks can saturate the
+    // fused chain's f16-rounded intermediates at any E, so a large oracle
+    // delta alone does not fail the test.
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -10589,33 +10598,130 @@ test "exl3 vk route E512 streamed cache" {
             try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got)[0])));
             try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got)[1]);
             try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
-            const ref = if (limit == 0) ref0 else ref10;
-            var got32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(got32);
-            try mlx.check(mlx.mlx_astype(&got32, got, .float32, s));
-            try mlx.check(mlx.mlx_array_eval(got32));
-            const g = mlx.mlx_array_data_float32(got32) orelse return error.F32Unreadable;
-            var worst: f64 = 0;
-            var worst_i: usize = 0;
-            for (0..rows * 2560) |i| {
-                const diff = @abs(@as(f64, g[i]) - ref[i]);
-                const tol = 0.02 + 0.01 * @abs(ref[i]);
-                if (diff > tol) {
-                    // Fail loudly: worst-class element, both values, and the
-                    // row's full expert id list (output columns mix all topk
-                    // slots of the row, so the list is the suspect set).
-                    const r = i / 2560;
-                    std.debug.print("exl3 vk route E512 DIVERGENCE rows={d} limit={d}: element r={d} o={d} got={d} ref={d} diff={d} tol={d} row_experts=", .{ rows, limit, r, i % 2560, g[i], ref[i], diff, tol });
-                    for (0..10) |k| std.debug.print("{d},", .{f.slots[r * 10 + k]});
-                    std.debug.print("\n", .{});
-                    return error.VkRouteE512Diverged;
+
+            // Control that removes the oracle: gather this sub-run's distinct
+            // experts (<= 31 of them) into an E=32 bank at first-appearance
+            // rank ids, remap the slots, keep x, scores and limit identical,
+            // and require the fused arm to answer bit-for-bit the same bf16
+            // output. Every per-expert decode input is byte-identical, so a
+            // mismatch means the output depends on E or on the slot ids (id
+            // wrap at 256, bank offset math, binding size), not on the
+            // random-bank f16 saturation that can blow the f64 oracle delta
+            // up at ANY E. Unused control slots carry copies of routed ones.
+            const gather = struct {
+                fn take(st: mlx.mlx_stream, src: mlx.mlx_array, idx: mlx.mlx_array) !mlx.mlx_array {
+                    var out = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(out);
+                    try mlx.check(mlx.mlx_take_axis(&out, src, idx, 0, st));
+                    return out;
                 }
-                if (diff > worst) {
-                    worst = diff;
-                    worst_i = i;
+            }.take;
+            var rank: [512]u32 = @splat(0xFFFFFFFF);
+            var ids: [32]u32 = @splat(0);
+            var n_sel: usize = 0;
+            for (f.slots[0 .. rows * 10]) |e| {
+                if (rank[e] == 0xFFFFFFFF) {
+                    rank[e] = @intCast(n_sel);
+                    ids[n_sel] = e;
+                    n_sel += 1;
                 }
             }
-            std.debug.print("exl3 vk route E512 rows={d} limit={d}: worst |diff| {d:.6} at r={d} o={d} (row experts {d},{d},...)\n", .{ rows, limit, worst, worst_i / 2560, worst_i % 2560, f.slots[(worst_i / 2560) * 10], f.slots[(worst_i / 2560) * 10 + 1] });
+            try std.testing.expect(n_sel <= 32);
+            var c: usize = n_sel;
+            while (c < 32) : (c += 1) ids[c] = ids[c % n_sel];
+            const idxa = mlx.mlx_array_new_data(&ids, &[_]c_int{32}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(idxa);
+            const tg32 = try gather(s, f.arrays[0], idxa);
+            defer _ = mlx.mlx_array_free(tg32);
+            const tu32a = try gather(s, f.arrays[1], idxa);
+            defer _ = mlx.mlx_array_free(tu32a);
+            const td32 = try gather(s, f.arrays[2], idxa);
+            defer _ = mlx.mlx_array_free(td32);
+            const tsuhg32 = try gather(s, f.arrays[3], idxa);
+            defer _ = mlx.mlx_array_free(tsuhg32);
+            const tsvhg32 = try gather(s, f.arrays[4], idxa);
+            defer _ = mlx.mlx_array_free(tsvhg32);
+            const tsuhu32 = try gather(s, f.arrays[3], idxa);
+            defer _ = mlx.mlx_array_free(tsuhu32);
+            const tsvhu32 = try gather(s, f.arrays[4], idxa);
+            defer _ = mlx.mlx_array_free(tsvhu32);
+            const tsuhd32 = try gather(s, f.arrays[5], idxa);
+            defer _ = mlx.mlx_array_free(tsuhd32);
+            const tsvhd32 = try gather(s, f.arrays[6], idxa);
+            defer _ = mlx.mlx_array_free(tsvhd32);
+            var cslots: [50]u32 = undefined;
+            for (f.slots[0 .. rows * 10], 0..) |e, i| cslots[i] = rank[e];
+            const slc32 = mlx.mlx_array_new_data(&cslots, &[_]c_int{@intCast(rows * 10)}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(slc32);
+            const calls1 = vk_route_calls;
+            const got32 = try moeSwigluClamped(s, xc, tg32, tsuhg32, tsvhg32, tu32a, tsuhu32, tsvhu32, td32, tsuhd32, tsvhd32, slc32, scc, 10, limit, .bfloat16);
+            defer _ = mlx.mlx_array_free(got32);
+            try std.testing.expect(vk_route_calls > calls1);
+            try std.testing.expectEqual(rows, @as(usize, @intCast(mlx.getShape(got32)[0])));
+            try std.testing.expectEqual(@as(c_int, 2560), mlx.getShape(got32)[1]);
+            try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got32));
+
+            const ref = if (limit == 0) ref0 else ref10;
+            var g512f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g512f);
+            try mlx.check(mlx.mlx_astype(&g512f, got, .float32, s));
+            var g32f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g32f);
+            try mlx.check(mlx.mlx_astype(&g32f, got32, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(g512f));
+            try mlx.check(mlx.mlx_array_eval(g32f));
+            const g5 = mlx.mlx_array_data_float32(g512f) orelse return error.F32Unreadable;
+            const g3 = mlx.mlx_array_data_float32(g32f) orelse return error.F32Unreadable;
+            var max_ref: f64 = 0;
+            var max_g5: f64 = 0;
+            var max_g3: f64 = 0;
+            var worst5: f64 = 0;
+            var worst5_i: usize = 0;
+            var worst3: f64 = 0;
+            var worst3_i: usize = 0;
+            for (0..rows * 2560) |i| {
+                const a_ref = @abs(ref[i]);
+                max_ref = @max(max_ref, a_ref);
+                max_g5 = @max(max_g5, @abs(@as(f64, g5[i])));
+                max_g3 = @max(max_g3, @abs(@as(f64, g3[i])));
+                const d5 = @abs(@as(f64, g5[i]) - ref[i]);
+                if (d5 > worst5) {
+                    worst5 = d5;
+                    worst5_i = i;
+                }
+                const d3 = @abs(@as(f64, g3[i]) - ref[i]);
+                if (d3 > worst3) {
+                    worst3 = d3;
+                    worst3_i = i;
+                }
+            }
+            // Informational only: random trellis banks can drive the fused
+            // chain's f16-rounded intermediates to saturation while the f64
+            // oracle does not, at ANY E; the gate is the control below.
+            std.debug.print("exl3 vk route E512 rows={d} limit={d}: max|ref| {d:.4} max|got512| {d:.4} max|got32| {d:.4}; oracle512 worst |diff| {d:.6} at r={d} o={d}; oracle32 worst |diff| {d:.6} at r={d} o={d}\n", .{ rows, limit, max_ref, max_g5, max_g3, worst5, worst5_i / 2560, worst5_i % 2560, worst3, worst3_i / 2560, worst3_i % 2560 });
+
+            // The gate: fused at E=512 vs fused at E=32, byte-identical
+            // decode inputs.
+            var diverged: ?usize = null;
+            for (0..rows * 2560) |i| {
+                if (g5[i] != g3[i]) {
+                    diverged = i;
+                    break;
+                }
+            }
+            if (diverged) |i| {
+                const r = i / 2560;
+                std.debug.print("exl3 vk route E512 CONTROL DIVERGENCE rows={d} limit={d}: element r={d} o={d} got512={d} got32={d} row_experts512=", .{ rows, limit, r, i % 2560, g5[i], g3[i] });
+                for (0..10) |k| {
+                    const e = f.slots[r * 10 + k];
+                    std.debug.print("{d}{s},", .{ e, if (e > 255) "(>255)" else "" });
+                }
+                std.debug.print(" row_experts32=", .{});
+                for (0..10) |k| std.debug.print("{d},", .{cslots[r * 10 + k]});
+                std.debug.print("\n", .{});
+                return error.VkRouteE512ControlDiverged;
+            }
+            std.debug.print("exl3 vk route E512 rows={d} limit={d}: control bit-exact over {d} elements\n", .{ rows, limit, rows * 2560 });
         }
     }
 }
