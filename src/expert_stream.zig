@@ -1538,7 +1538,10 @@ pub const Engine = struct {
         }
         self.last = acc;
         const scheduled = self.forward_count <= 2 or self.forward_count % BREAKDOWN_EVERY == 0;
-        if (!scheduled and !acc.probe) return;
+        const trace = if (std.c.getenv("SUSHI_KLD_TRACE")) |raw|
+            std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1")
+        else false;
+        if (!scheduled and !acc.probe and !trace) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
         log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d}\n", .{
             acc.forward,
