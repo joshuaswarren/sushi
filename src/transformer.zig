@@ -65064,6 +65064,55 @@ test "gdn plain recurrence: serial and chunked match the MSL kernel (Metal) or t
     }
 }
 
+test "gdn chunked recurrence coherent keys and chunk-local carry" {
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    // Coherent keys expose the feedback sign; no updates isolate carried decay.
+    for ([_]bool{ false, true }) |carry_only| {
+        for ([_]c_int{ 17, 129, 269 }) |t| {
+            const n: usize = @intCast(t);
+            const qd: [269]f32 = @splat(1);
+            const kd: [269]f32 = @splat(if (carry_only) 0 else 1);
+            const vd: [269]f32 = @splat(1);
+            const decay: f32 = if (carry_only) 127.0 / 128.0 else 1;
+            const beta_value: f32 = if (carry_only) 0 else 0.5;
+            const gd: [269]f32 = @splat(decay);
+            const bd: [269]f32 = @splat(beta_value);
+            var expected_state: f32 = if (carry_only) 1 else 0;
+            const state_data = [_]f32{expected_state};
+            const shape = [_]c_int{ 1, t, 1, 1 };
+            const gate_shape = [_]c_int{ 1, t, 1 };
+            const state_shape = [_]c_int{ 1, 1, 1, 1 };
+            const q = mlx.mlx_array_new_data(&qd, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(q);
+            const k = mlx.mlx_array_new_data(&kd, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(k);
+            const v = mlx.mlx_array_new_data(&vd, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(v);
+            const g = mlx.mlx_array_new_data(&gd, &gate_shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(g);
+            const beta = mlx.mlx_array_new_data(&bd, &gate_shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(beta);
+            const state = mlx.mlx_array_new_data(&state_data, &state_shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(state);
+            const actual = try gdn_decode.chunkedRecur(.{ .q = q, .k = k, .v = v, .g = g, .beta = beta, .state = state }, s);
+            defer actual.deinit();
+            const ys = try evalToF32(al, actual.y, n, s);
+            defer al.free(ys);
+            const final_state = try evalToF32(al, actual.state, 1, s);
+            defer al.free(final_state);
+            for (ys) |y| {
+                expected_state *= decay;
+                expected_state += kd[0] * beta_value * (1 - kd[0] * expected_state);
+                try testing.expect(std.math.isFinite(y));
+                try testing.expectApproxEqAbs(expected_state, y, 0.01);
+            }
+            try testing.expect(std.math.isFinite(final_state[0]));
+            try testing.expectApproxEqAbs(expected_state, final_state[0], 0.01);
+        }
+    }
+}
+
 /// `x[:, from:to]` on axis 1, any rank.
 fn gdnRecurRows(x: mlx.mlx_array, from: c_int, to: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(x);

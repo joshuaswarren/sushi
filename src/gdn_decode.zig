@@ -797,7 +797,7 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
 /// Chunked plain recurrence for prefill widths (S > MAX_SEQ): the FLA
 /// chunked gated-delta-rule formulation. Per chunk of 64 tokens, the
 /// within-chunk delta terms solve as one lower-triangular system
-/// (I − A)·U = β·v − β·e^L·(k·S_enter) with
+/// (I + A)·U = β·v − β·e^L·(k·S_enter) with
 /// A[i,j] = β_i·e^(L_i−L_j)·(k_i·k_j), L the in-chunk cumulative log decay;
 /// y = e^L·(q·S_enter) + Σ_j≤i e^(L_i−L_j)(q_i·k_j)·U_j; the chunk exit
 /// contribution e^(L_end−L_i)·k_i⊗U_i decays the carried state. All decay
@@ -850,9 +850,6 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
     // so a bf16-underflowed gate decays to (a very large finite) zero.
     var gclamp = try maximumScalar(gh, 1e-30, s); defer release(&gclamp);
     var logg = try logm(gclamp, s); defer release(&logg);
-    var lfull = try cumsumAxis2(logg, s); defer release(&lfull); // [B,Hv,tp]
-    var lr = try reshapeTo(lfull, &.{ b, hv, nc, cchunk }, s); defer release(&lr);
-    var lend = try sliceAxis(lr, 3, cchunk - 1, cchunk, s); defer release(&lend); // [B,Hv,nc,1]
 
     var s_enter = try astypeF32(in.state, s); // [B,Hv,Dv,Dk], loop-carried
     errdefer release(&s_enter);
@@ -867,8 +864,9 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         var qc0 = try sliceAxis(qh, 2, c0, c1, s); defer release(&qc0);
         var qct = try tileHeads(qc0, grp, s); defer release(&qct);
         var vc = try sliceAxis(vh, 2, c0, c1, s); defer release(&vc); // [B,Hv,C,dv]
-        var lc1 = try sliceAxis(lr, 2, @intCast(ci), @as(c_int, @intCast(ci)) + 1, s); defer release(&lc1); // [B,Hv,1,C]
-        var lc = try reshapeTo(lc1, &.{ b, hv, cchunk }, s); defer release(&lc);
+        // The incoming state already includes earlier chunks' decay.
+        var logc = try sliceAxis(logg, 2, c0, c1, s); defer release(&logc);
+        var lc = try cumsumAxis2(logc, s); defer release(&lc); // chunk-local [B,Hv,C]
         var lc4 = try reshapeTo(lc, &.{ b, hv, cchunk, 1 }, s); defer release(&lc4); // [B,Hv,C,1]
         var bc1 = try sliceAxis(bh, 2, c0, c1, s); defer release(&bc1);
         var bc4 = try reshapeTo(bc1, &.{ b, hv, cchunk, 1 }, s); defer release(&bc4);
@@ -888,10 +886,10 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         var aw = try mul(kk, fst, s); defer release(&aw);
         var amat = try mul(aw, bc4, s); defer release(&amat); // A[i,j] = β_i·e^(L_i−L_j)·(k_i·k_j)
 
-        // (I − A)^{-1} = Π_{k=0..5} (I + A^{2^k}): powers of one matrix
+        // (I + A)^{-1} = (I - A)·Π_{k=1..5} (I + A^{2^k}): powers of one matrix
         // commute, A is nilpotent at A^64. Five squarings, five products.
         var apow = try setCopy(amat, s); defer release(&apow);
-        var series = try add(amat, msk.ident, s); defer release(&series);
+        var series = try sub(msk.ident, amat, s); defer release(&series);
         var pp: c_int = 1;
         while (pp < 32) : (pp *= 2) {
             const ap2 = try matmul(apow, apow, s);
@@ -922,7 +920,7 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         try mlx.check(mlx.mlx_vector_array_append_value(y_parts, yc));
 
         // Chunk exit contribution; the carried state decays by e^(L_end).
-        var lend_c = try sliceAxis(lend, 2, @intCast(ci), @as(c_int, @intCast(ci)) + 1, s); defer release(&lend_c); // [B,Hv,1,1]
+        var lend_c = try sliceAxis(lc4, 2, cchunk - 1, cchunk, s); defer release(&lend_c); // [B,Hv,1,1]
         var end_diff = try sub(lend_c, lc4, s); defer release(&end_diff);
         var endw = try expm(end_diff, s); defer release(&endw);
         var uw = try mul(u, endw, s); defer release(&uw);
