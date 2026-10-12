@@ -55094,11 +55094,16 @@ fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx
 
 /// Eval an mlx array as f32 and copy its data into a fresh slice.
 fn evalToF32(al: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]f32 {
+    if (mlx.mlx_array_size(arr) != n) return error.ShapeMismatch;
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    const d = mlx.mlx_array_data_float32(f) orelse return error.InvalidDtype;
+    // A cast can retain transposed strides; the data accessor is physical, not logical.
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const d = mlx.mlx_array_data_float32(c) orelse return error.InvalidDtype;
     const out = try al.alloc(f32, n);
     @memcpy(out, d[0..n]);
     return out;
@@ -55106,7 +55111,10 @@ fn evalToF32(al: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_str
 
 fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
     var m: f32 = 0;
-    for (a, b) |x, y| m = @max(m, @abs(x - y));
+    for (a, b) |x, y| {
+        if (!std.math.isFinite(x) or !std.math.isFinite(y)) return std.math.inf(f32);
+        m = @max(m, @abs(x - y));
+    }
     return m;
 }
 
@@ -77421,4 +77429,26 @@ test "finite trace capture paths are runtime iterable" {
     try testing.expectEqual(@as(usize, 1), st.nan);
     try testing.expectEqual(@as(usize, 1), st.posinf);
     try testing.expectEqual(@as(usize, 1), st.neginf);
+}
+
+test "gdn plain recurrence: logical readback and nonfinite mismatch" {
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const base = mlx.mlx_array_new_data(&data, &.{ 2, 3 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
+        var cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, base, dt, s));
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_transpose_axes(&view, cast, &.{ 1, 0 }, 2, s));
+        const got = try evalToF32(al, view, 6, s);
+        defer al.free(got);
+        try testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, got);
+        try testing.expectError(error.ShapeMismatch, evalToF32(al, view, 7, s));
+    }
+    try testing.expectEqual(std.math.inf(f32), maxAbsDiff(&.{std.math.nan(f32)}, &.{1}));
+    try testing.expectEqual(std.math.inf(f32), maxAbsDiff(&.{1}, &.{std.math.inf(f32)}));
 }

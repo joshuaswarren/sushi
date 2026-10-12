@@ -648,7 +648,8 @@ fn tileHeads(x: mlx.mlx_array, grp: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     if (grp == 1) return setCopy(x, s);
     var out = mlx.mlx_array_new();
     errdefer release(&out);
-    try mlx.check(mlx.mlx_tile(&out, x, &.{ 1, grp, 1, 1 }, 4, s));
+    // GQA uses hk = hv / grp, not hv % hk: repeat each head contiguously.
+    try mlx.check(mlx.mlx_repeat_axis(&out, x, grp, 1, s));
     return out;
 }
 
@@ -888,6 +889,22 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         var aw = try mul(kk, fst, s); defer release(&aw);
         var amat = try mul(aw, bc4, s); defer release(&amat); // A[i,j] = β_i·e^(L_i−L_j)·(k_i·k_j)
 
+        // (I + A)^{-1} = (I - A)·Π_{k=1..log2(CHUNK)-1} (I + A^{2^k}): powers of one matrix
+        // commute, A is nilpotent at A^CHUNK. Large tiles amplify cancellation.
+        var apow = try setCopy(amat, s); defer release(&apow);
+        var series = try sub(msk.ident, amat, s); defer release(&series);
+        var pp: c_int = 1;
+        while (pp < CHUNK / 2) : (pp *= 2) {
+            const ap2 = try matmul(apow, apow, s);
+            release(&apow);
+            apow = ap2;
+            var eye = try add(apow, msk.ident, s);
+            const s2 = try matmul(series, eye, s);
+            release(&series);
+            release(&eye);
+            series = s2;
+        }
+
         var st = try transposeAxes(s_enter, &.{ 0, 1, 3, 2 }, s); defer release(&st); // [B,Hv,dk,dv]
         var s0t = try matmul(kgt, st, s); defer release(&s0t); // k·S_enter [B,Hv,C,dv]
         var exp_lc = try expm(lc4, s); defer release(&exp_lc); // ≤ 1
@@ -895,45 +912,7 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         var scarry2 = try mul(scarry, exp_lc, s); defer release(&scarry2); // β_i·e^(L_i)·(k_i·S_enter)
         var vbeta = try mul(vc, bc4, s); defer release(&vbeta); // β_i·v_i
         var rhs = try sub(vbeta, scarry2, s); defer release(&rhs);
-        // Forward substitution for the unit-lower-triangular (I + A)·U = rhs:
-        // exact in C-1 matmuls, no A powers, no cancellation. ponytail: the
-        // loop is C iterations by construction (CHUNK is 8); a closed form
-        // needs the same matmuls without the sync points.
-        var u = try setCopy(rhs, s);
-        errdefer release(&u);
-        var ci_fwd: c_int = 1;
-        while (ci_fwd < cchunk) : (ci_fwd += 1) {
-            var a_cols = try sliceAxis(amat, 3, 0, ci_fwd, s); // [B,Hv,C,ci]
-            defer release(&a_cols);
-            var u_rows = try sliceAxis(u, 2, 0, ci_fwd, s); // [B,Hv,ci,dv]
-            defer release(&u_rows);
-            var corr = try matmul(a_cols, u_rows, s); // [B,Hv,C,dv]
-            defer release(&corr);
-            var rhs_i = try sliceAxis(rhs, 2, ci_fwd, ci_fwd + 1, s);
-            defer release(&rhs_i);
-            var corr_i = try sliceAxis(corr, 2, ci_fwd, ci_fwd + 1, s);
-            defer release(&corr_i);
-            var fixed = try sub(rhs_i, corr_i, s);
-            defer release(&fixed);
-            var tail = try sliceAxis(u, 2, ci_fwd, cchunk, s);
-            defer release(&tail);
-            const joined_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(joined_vec);
-            try mlx.check(mlx.mlx_vector_array_append_value(joined_vec, fixed));
-            try mlx.check(mlx.mlx_vector_array_append_value(joined_vec, tail));
-            var joined = try concatParts(joined_vec, 2, s);
-            defer release(&joined);
-            // Rows below ci_fwd are untouched: A is strictly lower.
-            var head = try sliceAxis(u, 2, 0, ci_fwd, s);
-            defer release(&head);
-            const both_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(both_vec);
-            try mlx.check(mlx.mlx_vector_array_append_value(both_vec, head));
-            try mlx.check(mlx.mlx_vector_array_append_value(both_vec, joined));
-            const both = try concatParts(both_vec, 2, s);
-            release(&u);
-            u = both;
-        }
+        var u = try matmul(series, rhs, s); defer release(&u);
 
         var qq = try matmul(qct, kt, s); defer release(&qq);
         var w = try mul(qq, fin, s); defer release(&w);
