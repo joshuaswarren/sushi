@@ -3580,6 +3580,169 @@ pub fn vkBankGateOn() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// Element-wise compare result for one checked fused-vs-host call.
+pub const VkCheckStats = struct {
+    maxabs: f64 = 0,
+    maxrel: f64 = 0,
+    worst_idx: i64 = -1,
+    worst_fused: f32 = 0,
+    worst_host: f32 = 0,
+    nan_fused: u64 = 0,
+    nan_host: u64 = 0,
+};
+
+/// Compare two equally sized f32 buffers (bf16 outputs are widened on
+/// read). NaN pairs are counted, not scored, so a NaN fused value cannot
+/// poison maxabs/maxrel. maxrel floors the denominator at 1e-6 so a
+/// near-zero reference value cannot manufacture an infinite ratio.
+pub fn vkCheckStats(fused: []const f32, host: []const f32) VkCheckStats {
+    var st = VkCheckStats{};
+    for (fused, host, 0..) |fv, hv, i| {
+        if (std.math.isNan(fv)) {
+            st.nan_fused += 1;
+            continue;
+        }
+        if (std.math.isNan(hv)) {
+            st.nan_host += 1;
+            continue;
+        }
+        const d = @abs(@as(f64, fv) - @as(f64, hv));
+        const rel = d / @max(@abs(@as(f64, hv)), 1e-6);
+        if (st.worst_idx < 0 or d > st.maxabs) {
+            st.maxabs = d;
+            st.worst_idx = @intCast(i);
+            st.worst_fused = fv;
+            st.worst_host = hv;
+        }
+        if (rel > st.maxrel) st.maxrel = rel;
+    }
+    return st;
+}
+
+fn vkCheckEnvCount(comptime name: [:0]const u8) usize {
+    const v = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+}
+
+/// `SUSHI_EXL3_VK_CHECK=N`: for the first N non-Metal fused-route calls,
+/// ALSO run the host plainMoeFused reference over identical inputs and log
+/// `[exl3-check] ...` with the element-wise deltas. `SUSHI_EXL3_VK_CHECK_SKIP=M`
+/// starts at call M+1. Off by default (0 = no behavior change); the fused
+/// output returned to the model is never touched.
+fn vkCheckWants(call: usize) bool {
+    const n = vkCheckEnvCount("SUSHI_EXL3_VK_CHECK");
+    if (n == 0) return false;
+    const skip = vkCheckEnvCount("SUSHI_EXL3_VK_CHECK_SKIP");
+    return call > skip and call <= skip + n;
+}
+
+const VkCheckState = struct {
+    wanted: usize = 0,
+    checked: usize = 0,
+    nan_total: u64 = 0,
+    nan_host_total: u64 = 0,
+    worst_call: usize = 0,
+    worst_rows: c_int = 0,
+    worst_maxabs: f64 = 0,
+    worst_maxrel: f64 = 0,
+    worst_idx: i64 = -1,
+    worst_fused: f32 = 0,
+    worst_host: f32 = 0,
+};
+
+var vk_check_state = VkCheckState{};
+
+/// Eval'd array -> f32 buffer. bf16 rides the u16 accessor widened by a
+/// 16-bit shift; mlx-c data_<T>() does not check the dtype.
+fn vkCheckReadF32(a: mlx.mlx_array, out: []f32) !void {
+    switch (mlx.mlx_array_dtype(a)) {
+        .float32 => @memcpy(out, (mlx.mlx_array_data_float32(a) orelse return error.F32Unreadable)[0..out.len]),
+        .float16 => for ((mlx.mlx_array_data_float16(a) orelse return error.F32Unreadable)[0..out.len], 0..) |v, i| {
+            out[i] = @floatCast(v);
+        },
+        .bfloat16 => for ((mlx.mlx_array_data_bfloat16(a) orelse return error.F32Unreadable)[0..out.len], 0..) |v, i| {
+            out[i] = @bitCast(@as(u32, v) << 16);
+        },
+        else => return error.F32Unreadable,
+    }
+}
+
+/// Host reference over the identical inputs the fused op just consumed:
+/// same x, same slot/score tables, same bank arrays and the same
+/// active_decode window (plainMoeFused evals and reads them itself).
+/// Costs seconds per call; diagnostics only, so the host result and both
+/// host copies die in this arena and the fused y is returned untouched.
+fn vkCheckRun(
+    call: usize,
+    rows: c_int,
+    s: mlx.mlx_stream,
+    y: mlx.mlx_array,
+    x: mlx.mlx_array,
+    gate_t: mlx.mlx_array,
+    gate_suh: mlx.mlx_array,
+    gate_svh: mlx.mlx_array,
+    up_t: mlx.mlx_array,
+    up_suh: mlx.mlx_array,
+    up_svh: mlx.mlx_array,
+    down_t: mlx.mlx_array,
+    down_suh: mlx.mlx_array,
+    down_svh: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    scores: mlx.mlx_array,
+    hidden: c_int,
+    inter: c_int,
+    topk: c_int,
+    limit: c_int,
+    out_dtype: mlx.mlx_dtype,
+) void {
+    if (mlx.streamIsMetal(s) or !mlx.streamIsGpu(s)) return;
+    if (vk_check_state.wanted == 0) vk_check_state.wanted = vkCheckEnvCount("SUSHI_EXL3_VK_CHECK");
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var st = VkCheckStats{};
+    var ok = false;
+    blk: {
+        const hy = hostMoeFallback(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype) catch |e| {
+            log.warn("[exl3-check] call={d} host reference failed: {s}\n", .{ call, @errorName(e) });
+            break :blk;
+        };
+        defer _ = mlx.mlx_array_free(hy);
+        mlx.check(mlx.mlx_array_eval(y)) catch break :blk;
+        mlx.check(mlx.mlx_array_eval(hy)) catch break :blk;
+        const sh = mlx.getShape(y);
+        const hsh = mlx.getShape(hy);
+        if (sh.len != hsh.len or !std.mem.eql(c_int, sh, hsh)) {
+            log.warn("[exl3-check] call={d} shape mismatch fused={any} host={any}\n", .{ call, sh, hsh });
+            break :blk;
+        }
+        const n: usize = @intCast(if (sh.len == 1) sh[0] else sh[0] * sh[1]);
+        const fbuf = alloc.alloc(f32, n) catch break :blk;
+        const hbuf = alloc.alloc(f32, n) catch break :blk;
+        vkCheckReadF32(y, fbuf) catch break :blk;
+        vkCheckReadF32(hy, hbuf) catch break :blk;
+        st = vkCheckStats(fbuf, hbuf);
+        ok = true;
+    }
+    // No layer index exists at this call site; within one forward the call
+    // ordinal IS the layer ordinal, so layer mirrors call.
+    if (ok) log.info("[exl3-check] call={d} rows={d} layer={d} maxabs={e:.6} maxrel={e:.6} worst_idx={d} fused={e:.6} host={e:.6} nan={d}\n", .{ call, rows, call, st.maxabs, st.maxrel, st.worst_idx, @as(f64, st.worst_fused), @as(f64, st.worst_host), st.nan_fused });
+    vk_check_state.checked += 1;
+    vk_check_state.nan_total += st.nan_fused;
+    vk_check_state.nan_host_total += st.nan_host;
+    if (ok and (vk_check_state.worst_call == 0 or st.maxabs > vk_check_state.worst_maxabs)) {
+        vk_check_state.worst_call = call;
+        vk_check_state.worst_rows = rows;
+        vk_check_state.worst_maxabs = st.maxabs;
+        vk_check_state.worst_maxrel = st.maxrel;
+        vk_check_state.worst_idx = st.worst_idx;
+        vk_check_state.worst_fused = st.worst_fused;
+        vk_check_state.worst_host = st.worst_host;
+    }
+    if (vk_check_state.checked >= vk_check_state.wanted)
+        log.info("[exl3-check] summary checked={d} wanted={d} nan_total={d} nan_host_total={d} worst_call={d} worst_rows={d} worst_maxabs={e:.6} worst_maxrel={e:.6} worst_idx={d} worst_fused={e:.6} worst_host={e:.6}\n", .{ vk_check_state.checked, vk_check_state.wanted, vk_check_state.nan_total, vk_check_state.nan_host_total, vk_check_state.worst_call, vk_check_state.worst_rows, vk_check_state.worst_maxabs, vk_check_state.worst_maxrel, vk_check_state.worst_idx, @as(f64, vk_check_state.worst_fused), @as(f64, vk_check_state.worst_host) });
+}
+
 /// The non-Metal GPU route is on by default; SUSHI_EXL3_HOST=1 forces the
 /// host plainMoeFused loop. The composed primitive implements the MCG
 /// codebook (every current pack), so other codebooks stay on the host.
@@ -3670,6 +3833,11 @@ fn vkMoeFused(
     if (exl3UbenchOn()) try mlx.check(mlx.mlx_array_eval(y));
     const ms = @divTrunc(t_start.untilNow(io, .boot).nanoseconds, 1_000_000);
     log.info("[exl3-vk] rows={d} slots={d} {d} ms\n", .{ rows, rows * topk, ms });
+    // SUSHI_EXL3_VK_CHECK=N: compare this fused result against the host
+    // plainMoeFused reference over identical inputs. Diagnostics only; the
+    // fused y below is returned untouched either way.
+    if (vkCheckWants(vk_route_calls))
+        vkCheckRun(vk_route_calls, rows, s, y, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype);
     return y;
 }
 
@@ -10405,6 +10573,53 @@ test "decoded expert bank sizing gates the composed vk arm" {
     _ = setenv("SUSHI_EXL3_VK_BANKGATE", "0", 1);
     defer _ = unsetenv("SUSHI_EXL3_VK_BANKGATE");
     try std.testing.expect(!vkBankGateOn());
+}
+
+test "exl3 vk check gate windows the first N calls after M skipped" {
+    // Pure env arithmetic, CPU-safe: N=0 (default) must keep the check off
+    // entirely, and SKIP shifts the checked window, not its size.
+    _ = setenv("SUSHI_EXL3_VK_CHECK", "2", 1);
+    defer _ = unsetenv("SUSHI_EXL3_VK_CHECK");
+    try std.testing.expect(vkCheckWants(1));
+    try std.testing.expect(vkCheckWants(2));
+    try std.testing.expect(!vkCheckWants(3));
+    _ = setenv("SUSHI_EXL3_VK_CHECK_SKIP", "3", 1);
+    defer _ = unsetenv("SUSHI_EXL3_VK_CHECK_SKIP");
+    try std.testing.expect(!vkCheckWants(3));
+    try std.testing.expect(vkCheckWants(4));
+    try std.testing.expect(vkCheckWants(5));
+    try std.testing.expect(!vkCheckWants(6));
+    _ = setenv("SUSHI_EXL3_VK_CHECK", "0", 1);
+    try std.testing.expect(!vkCheckWants(1));
+}
+
+test "exl3 vk check stats localize the worst element and count NaN pairs" {
+    // Pure f32 math, CPU-safe: this pins the numbers the [exl3-check] lines
+    // report before any device run consumes them.
+    const t = std.testing;
+    const eq = vkCheckStats(&[_]f32{ 1, -2, 3 }, &[_]f32{ 1, -2, 3 });
+    try t.expectEqual(@as(f64, 0), eq.maxabs);
+    try t.expectEqual(@as(f64, 0), eq.maxrel);
+    try t.expectEqual(@as(i64, 0), eq.worst_idx);
+    // Worst absolute delta lands on index 0; maxrel is elementwise
+    // independent (the small near-zero element owns it).
+    const w = vkCheckStats(&[_]f32{ 1000, 1.0 }, &[_]f32{ 999, 0.9 });
+    try t.expectEqual(@as(i64, 0), w.worst_idx);
+    try t.expectEqual(@as(f64, 1), w.maxabs);
+    try t.expectApproxEqAbs(@as(f64, 0.1 / 0.9), w.maxrel, 1e-12);
+    try t.expectEqual(@as(f32, 1000), w.worst_fused);
+    try t.expectEqual(@as(f32, 999), w.worst_host);
+    // NaN fused values are counted, never scored.
+    const nn = vkCheckStats(&[_]f32{ std.math.nan(f32), 1.5 }, &[_]f32{ 1, 1 });
+    try t.expectEqual(@as(u64, 1), nn.nan_fused);
+    try t.expectEqual(@as(i64, 1), nn.worst_idx);
+    try t.expectEqual(@as(f64, 0.5), nn.maxabs);
+    const hn = vkCheckStats(&[_]f32{1}, &[_]f32{std.math.nan(f32)});
+    try t.expectEqual(@as(u64, 1), hn.nan_host);
+    // A zero reference floors the rel denominator instead of dividing by zero.
+    const z = vkCheckStats(&[_]f32{2}, &[_]f32{0});
+    try t.expectEqual(@as(f64, 2), z.maxabs);
+    try t.expectEqual(@as(f64, 2e6), z.maxrel);
 }
 
 test "exl3 vk route matches the f64 host oracle at pack shapes" {
