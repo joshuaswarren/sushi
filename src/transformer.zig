@@ -20289,8 +20289,8 @@ pub const Transformer = struct {
     /// SUSHI_FINITE_TRACE=N: for the first N forwards (prefill chunks and
     /// decode steps both count) check the trunk's per-layer residual and the
     /// logits for non-finite values, logging the first forward and layer
-    /// where they appear. Zero behavior change when unset or 0. Logs only on
-    /// detection plus one armed and one done line per trace.
+    /// where they appear. Zero behavior change when unset or 0. Logs counts
+    /// and finite extrema for each tensor plus armed and done lines.
     /// ponytail: localization stops at layer boundaries (the CaptureLayers
     /// granularity); per-op capture (capture_hidden_all) is the upgrade if a
     /// bad layer ever needs splitting into attention vs MLP.
@@ -20321,12 +20321,13 @@ pub const Transformer = struct {
             log.info("[finite] armed n={d} path={s} layers={d}\n", .{ finite_trace_budget, finiteTracePathName(self), cl.out.len });
         }
         const logits = try self.forwardDispatch(ctx, token_ids);
+        errdefer _ = mlx.mlx_array_free(logits);
         var first_bad: ?FiniteFirst = null;
         var filled: usize = 0;
         for (cl.out, 0..) |h, li| {
             if (mlx.mlx_array_size(h) == 0) continue;
             filled += 1;
-            if (finiteTraceCheckArray(self, h, fwd, li, cl.out.len)) {
+            if (try finiteTraceCheckArray(self, h, fwd, li, cl.out.len)) {
                 if (first_bad == null) first_bad = .{ .fwd = fwd, .layer = li };
             }
         }
@@ -20335,7 +20336,7 @@ pub const Transformer = struct {
             // say so once, keep the logits check.
             log.info("[finite] fwd={d} layer capture came back empty; logits only\n", .{fwd});
         }
-        if (finiteTraceCheckArray(self, logits, fwd, null, 0)) {
+        if (try finiteTraceCheckArray(self, logits, fwd, null, 0)) {
             if (first_bad == null) first_bad = .{ .fwd = fwd, .layer = null };
         }
         if (first_bad != null) finite_trace_bad_fwds += 1;
@@ -20370,7 +20371,7 @@ pub const Transformer = struct {
     }
 
     const FiniteFirst = struct { fwd: u64, layer: ?usize };
-    const FiniteStats = struct { bad: usize = 0, first: usize = 0, min: f32 = 0, max: f32 = 0 };
+    const FiniteStats = struct { bad: usize = 0, nan: usize = 0, posinf: usize = 0, neginf: usize = 0, first: usize = 0, min: f32 = 0, max: f32 = 0 };
 
     /// `SUSHI_FINITE_TRACE` parsed once: absent, 0 or garbage = off.
     fn finiteTraceParse(raw: ?[*:0]const u8) u32 {
@@ -20404,7 +20405,7 @@ pub const Transformer = struct {
     /// silently, so installing there would check nothing).
     fn finiteTraceCaptures(self: *const Transformer) bool {
         const p = self.finiteTracePathName();
-        for (.{ "standard", "qwen4", "moe", "hybrid" }) |name| {
+        for ([_][]const u8{ "standard", "qwen4", "moe", "hybrid" }) |name| {
             if (std.mem.eql(u8, p, name)) return true;
         }
         return false;
@@ -20413,6 +20414,7 @@ pub const Transformer = struct {
     /// Host scan of one tensor (already f32): NaN/Inf count, first flat
     /// index, extrema over the FINITE entries only. Pure — testable without mlx.
     fn finiteScanStats(src: []const f32) FiniteStats {
+        @setFloatMode(.strict);
         var st = FiniteStats{ .min = std.math.floatMax(f32), .max = -std.math.floatMax(f32) };
         for (src, 0..) |v, i| {
             if (std.math.isFinite(v)) {
@@ -20421,6 +20423,7 @@ pub const Transformer = struct {
             } else {
                 if (st.bad == 0) st.first = i;
                 st.bad += 1;
+                if (std.math.isNan(v)) st.nan += 1 else if (v > 0) st.posinf += 1 else st.neginf += 1;
             }
         }
         if (st.bad == src.len) {
@@ -20430,26 +20433,25 @@ pub const Transformer = struct {
         return st;
     }
 
-    /// Eval one array through an f32 copy and log it when any entry is not
-    /// finite. Never errors: an mlx failure just skips the check.
-    fn finiteTraceCheckArray(self: *Transformer, arr: mlx.mlx_array, fwd: u64, layer: ?usize, n_layers: usize) bool {
+    /// Eval one array through an f32 copy. Readback failures must not be
+    /// reported as clean; errors propagate only while this diagnostic is armed.
+    fn finiteTraceCheckArray(self: *Transformer, arr: mlx.mlx_array, fwd: u64, layer: ?usize, n_layers: usize) !bool {
         var contig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(contig);
-        if (mlx.mlx_contiguous(&contig, arr, false, self.s) != 0) return false;
+        try mlx.check(mlx.mlx_contiguous(&contig, arr, false, self.s));
         var wide = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wide);
-        if (mlx.mlx_astype(&wide, contig, .float32, self.s) != 0) return false;
-        if (mlx.mlx_array_eval(wide) != 0) return false;
+        try mlx.check(mlx.mlx_astype(&wide, contig, .float32, self.s));
+        try mlx.check(mlx.mlx_array_eval(wide));
         const n = mlx.mlx_array_size(wide);
-        const src = mlx.mlx_array_data_float32(wide) orelse return false;
+        const src = mlx.mlx_array_data_float32(wide) orelse return error.FiniteTraceReadbackFailed;
         const st = finiteScanStats(src[0..n]);
-        if (st.bad == 0) return false;
         if (layer) |li| {
-            log.info("[finite] fwd={d} layer={d}/{d} nonfinite={d}/{d} first={d} min={d} max={d}\n", .{ fwd, li, n_layers, st.bad, n, st.first, st.min, st.max });
+            log.info("[finite] fwd={d} layer={d}/{d} nonfinite={d}/{d} nan={d} posinf={d} neginf={d} first={d} min={d} max={d}\n", .{ fwd, li, n_layers, st.bad, n, st.nan, st.posinf, st.neginf, st.first, st.min, st.max });
         } else {
-            log.info("[finite] fwd={d} logits nonfinite={d}/{d} first={d} min={d} max={d}\n", .{ fwd, st.bad, n, st.first, st.min, st.max });
+            log.info("[finite] fwd={d} logits nonfinite={d}/{d} nan={d} posinf={d} neginf={d} first={d} min={d} max={d}\n", .{ fwd, st.bad, n, st.nan, st.posinf, st.neginf, st.first, st.min, st.max });
         }
-        return true;
+        return st.bad > 0;
     }
 
     var finite_trace_parsed: bool = false;
@@ -77352,4 +77354,22 @@ test "finite trace budget parse: absent, zero, garbage, value, overflow" {
     try testing.expectEqual(@as(u32, 0), T.finiteTraceParse("yes"));
     try testing.expectEqual(@as(u32, 40), T.finiteTraceParse("40"));
     try testing.expectEqual(@as(u32, 0), T.finiteTraceParse("4294967296"));
+}
+
+test "finite trace capture paths are runtime iterable" {
+    var xfm: Transformer = undefined;
+    xfm.dsv4 = null;
+    xfm.glm5 = null;
+    xfm.bert_layers = null;
+    xfm.config.use_bidirectional_attention = false;
+    xfm.hybrid_layers = null;
+    xfm.qwen4 = null;
+    xfm.moe_layers = null;
+    try testing.expect(xfm.finiteTraceCaptures());
+    xfm.config.use_bidirectional_attention = true;
+    try testing.expect(!xfm.finiteTraceCaptures());
+    const st = Transformer.finiteScanStats(&.{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) });
+    try testing.expectEqual(@as(usize, 1), st.nan);
+    try testing.expectEqual(@as(usize, 1), st.posinf);
+    try testing.expectEqual(@as(usize, 1), st.neginf);
 }
