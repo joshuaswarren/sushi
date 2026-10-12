@@ -682,7 +682,9 @@ fn padTime(x: mlx.mlx_array, rows: c_int, comptime ones: bool, s: mlx.mlx_stream
 
 /// Causal masks over one CHUNK-sized tile: exponent-domain pushdowns (0
 /// keep / MASK_BIG discard) and the identity for the triangular inverse.
-const CHUNK: usize = 64;
+// ponytail: eight-token tiles bound f32 inverse cancellation for normalized keys;
+// larger tiles need a stable triangular solve, not high powers of A.
+const CHUNK: usize = 8;
 const MASK_BIG: f32 = 1e4;
 const Masks = struct { strict_big: mlx.mlx_array, incl_big: mlx.mlx_array, ident: mlx.mlx_array };
 var masks: ?Masks = null;
@@ -795,7 +797,7 @@ pub fn serialRecur(in: PlainIn, want_seq: bool, s: mlx.mlx_stream) !PlainOut {
 }
 
 /// Chunked plain recurrence for prefill widths (S > MAX_SEQ): the FLA
-/// chunked gated-delta-rule formulation. Per chunk of 64 tokens, the
+/// chunked gated-delta-rule formulation. Per chunk of eight tokens, the
 /// within-chunk delta terms solve as one lower-triangular system
 /// (I + A)·U = β·v − β·e^L·(k·S_enter) with
 /// A[i,j] = β_i·e^(L_i−L_j)·(k_i·k_j), L the in-chunk cumulative log decay;
@@ -886,12 +888,12 @@ pub fn chunkedRecur(in: PlainIn, s: mlx.mlx_stream) !PlainOut {
         var aw = try mul(kk, fst, s); defer release(&aw);
         var amat = try mul(aw, bc4, s); defer release(&amat); // A[i,j] = β_i·e^(L_i−L_j)·(k_i·k_j)
 
-        // (I + A)^{-1} = (I - A)·Π_{k=1..5} (I + A^{2^k}): powers of one matrix
-        // commute, A is nilpotent at A^64. Five squarings, five products.
+        // (I + A)^{-1} = (I - A)·Π_{k=1..log2(CHUNK)-1} (I + A^{2^k}): powers of one matrix
+        // commute, A is nilpotent at A^CHUNK. Large tiles amplify cancellation.
         var apow = try setCopy(amat, s); defer release(&apow);
         var series = try sub(msk.ident, amat, s); defer release(&series);
         var pp: c_int = 1;
-        while (pp < 32) : (pp *= 2) {
+        while (pp < CHUNK / 2) : (pp *= 2) {
             const ap2 = try matmul(apow, apow, s);
             release(&apow);
             apow = ap2;

@@ -65068,14 +65068,14 @@ test "gdn chunked recurrence coherent keys and chunk-local carry" {
     const s = mlx.gpuStream();
     const al = testing.allocator;
     // Coherent keys expose the feedback sign; no updates isolate carried decay.
-    for ([_]bool{ false, true }) |carry_only| {
+    for ([_]f32{ 0.5, 1.0, 0.0 }) |beta_value| {
+        const carry_only = beta_value == 0;
         for ([_]c_int{ 17, 129, 269 }) |t| {
             const n: usize = @intCast(t);
             const qd: [269]f32 = @splat(1);
             const kd: [269]f32 = @splat(if (carry_only) 0 else 1);
             const vd: [269]f32 = @splat(1);
             const decay: f32 = if (carry_only) 127.0 / 128.0 else 1;
-            const beta_value: f32 = if (carry_only) 0 else 0.5;
             const gd: [269]f32 = @splat(decay);
             const bd: [269]f32 = @splat(beta_value);
             var expected_state: f32 = if (carry_only) 1 else 0;
