@@ -3802,6 +3802,12 @@ fn vkMoeFused(
     limit: c_int,
     out_dtype: mlx.mlx_dtype,
 ) !mlx.mlx_array {
+    // Apple's mlx-c (macOS builds) has no `mlx_fast_exl3_moe`: it is an omarchy-mlx (Vulkan)
+    // C ABI. This arm is only reached on non-Metal streams, so exclude the extern at compile
+    // time on macOS (same `comptime os.tag` convention as expert_io.zig) and keep the host
+    // fallback; Linux keeps the composed primitive below.
+    if (comptime @import("builtin").os.tag == .macos)
+        return hostMoeFallback(s, x, gate_t, gate_suh, gate_svh, up_t, up_suh, up_svh, down_t, down_suh, down_svh, slots, scores, hidden, inter, topk, limit, out_dtype);
     const sh = mlx.getShape(x);
     const rows: c_int = if (sh.len == 1) 1 else sh[0];
     // The C ABI takes the slot/score tables as [rows, topk]; sushi hands
