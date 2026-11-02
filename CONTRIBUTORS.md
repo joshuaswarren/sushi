@@ -39,6 +39,7 @@
 - [@ViRb3](https://github.com/ViRb3)
 - [@wasd-c](https://github.com/wasd-c)
 - [@yoyo930021](https://github.com/yoyo930021)
+
 _Linked GitHub accounts only. Anonymous (unlinked) commit authors are
 enumerable through the API (anon=true) but are identified there only by
 name/email, which this registry does not publish; credit them by hand in
