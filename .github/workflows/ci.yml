@@ -21,6 +21,12 @@ concurrency:
 
 jobs:
   build-test:
+    # Registry-refresh PRs are opened by github-actions[bot]
+    # (contributors.yml) and carry no code: their CI runs just sat in the
+    # macOS queue until cancelled - one such PR queued 65h and failed
+    # (2026-11-16, ~3,909 of this workflow's 4,063 D1 minutes). Human
+    # PRs keep the full gate.
+    if: github.actor != 'github-actions[bot]'
     runs-on: macos-26
     timeout-minutes: 90
     steps:
